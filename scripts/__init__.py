@@ -1,2 +1,2 @@
-"""Scripts package for live-audio-classifier."""
+"""Scripts package for live-music-classifier."""
 

@@ -1,4 +1,4 @@
-"""Shared model building utilities for live-audio-classifier."""
+"""Shared model building utilities for live-music-classifier."""
 import torch.nn as nn
 from utils.logging import get_logger
 

@@ -27,11 +27,11 @@ def save_spectrogram_image(log_mel: torch.Tensor, out_path: Path):
     plt.close(fig)
 
 def main():
-    ap = argparse.ArgumentParser(description="Predict UrbanSound8K class for a WAV file.")
+    ap = argparse.ArgumentParser(description="Predict music genre for a WAV file.")
     ap.add_argument("--wav", type=str, required=True, help="Path to a mono WAV (any sr; will be resampled).")
     ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt", help="Model weights .pt file.")
     ap.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"], help="Model type.")
-    ap.add_argument("--data_root", type=str, required=True, help="UrbanSound8K root (for class names).")
+    ap.add_argument("--data_root", type=str, required=True, help="GTZAN root directory (for class names).")
     ap.add_argument("--sr", type=int, default=16000, help="Target sample rate for preprocessing.")
     ap.add_argument("--n_mels", type=int, default=64)
     ap.add_argument("--n_fft", type=int, default=1024)

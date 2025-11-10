@@ -16,7 +16,7 @@ For an interactive tutorial, open `live-audio-classifier-tutorial.ipynb` in Jupy
 
 ```bash
 # Set your data root
-export DATA_ROOT=/path/to/UrbanSound8K
+export DATA_ROOT=/path/to/GTZAN
 
 # Run training example
 bash examples/train_example.sh
@@ -25,9 +25,9 @@ bash examples/train_example.sh
 Or run directly:
 ```bash
 python train.py \
-    --data_root /path/to/UrbanSound8K \
-    --train_folds 1,2,3,4,5,6,7,8,9 \
-    --val_folds 10 \
+    --data_root /path/to/GTZAN \
+    --train_ratio 0.8 \
+    --val_ratio 0.1 \
     --batch_size 16 \
     --epochs 5 \
     --model smallcnn \
@@ -45,7 +45,7 @@ Or run directly:
 ```bash
 python predict.py \
     --wav /path/to/your_audio.wav \
-    --data_root /path/to/UrbanSound8K \
+    --data_root /path/to/GTZAN \
     --model smallcnn \
     --topk 5
 ```
@@ -64,7 +64,7 @@ For real-time microphone input:
 
 ```bash
 python scripts/stream_infer.py \
-    --data_root /path/to/UrbanSound8K \
+    --data_root /path/to/GTZAN \
     --checkpoint artifacts/best_model.pt \
     --model smallcnn \
     --win_sec 4.0 \
@@ -77,8 +77,8 @@ Browse the dataset interactively:
 
 ```bash
 python scripts/vis_dataset.py \
-    --data_root /path/to/UrbanSound8K \
-    --folds 10 \
+    --data_root /path/to/GTZAN \
+    --split test \
     --checkpoint artifacts/best_model.pt \
     --model smallcnn \
     --play_audio
@@ -89,7 +89,7 @@ python scripts/vis_dataset.py \
 Set these to avoid specifying paths repeatedly:
 
 ```bash
-export DATA_ROOT=/path/to/UrbanSound8K
+export DATA_ROOT=/path/to/GTZAN
 ```
 
 ## Model Architectures
@@ -105,9 +105,9 @@ Switch between them using the `--model` flag:
 
 ## Tips
 
-1. **First time setup**: Make sure you have the UrbanSound8K dataset downloaded and extracted
+1. **First time setup**: Make sure you have the GTZAN dataset downloaded and extracted
 2. **Training**: Start with SmallCNN for faster iteration, then try ResNet18 for better accuracy
-3. **Inference**: The model expects 4-second audio clips at 16kHz sample rate
+3. **Inference**: The model expects 30-second audio clips at 16kHz sample rate (GTZAN standard)
 4. **Live streaming**: Use `--device` flag to select a specific microphone if you have multiple
 
 ## Troubleshooting

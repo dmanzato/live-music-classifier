@@ -3,12 +3,12 @@
 Quick start example: Train a model and run inference.
 
 This example demonstrates the basic workflow:
-1. Train a SmallCNN model on UrbanSound8K
+1. Train a SmallCNN model on GTZAN
 2. Run inference on a test audio file
 3. Display predictions
 
 Prerequisites:
-- UrbanSound8K dataset downloaded and extracted
+- GTZAN dataset downloaded and extracted
 - Set DATA_ROOT environment variable or update the path below
 """
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def main():
     # Configuration
-    data_root = os.getenv("DATA_ROOT", "/path/to/UrbanSound8K")
+    data_root = os.getenv("DATA_ROOT", "/path/to/GTZAN")
     
     if not Path(data_root).exists():
         print(f"Error: Data root not found: {data_root}")

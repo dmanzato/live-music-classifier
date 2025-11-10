@@ -1,10 +1,10 @@
-# Developer UX for live-audio-classifier
+# Developer UX for live-music-classifier
 # Usage:
 #   make setup                  # create .venv + install deps
-#   make train                  # train on UrbanSound8K
+#   make train                  # train on GTZAN
 #   make predict FILE=...       # run predict.py on a WAV
 #   make stream [DEVICE=...]    # live mic inference
-#   make vis [FOLDS=10]         # dataset visualizer
+#   make vis [SPLIT=test]       # dataset visualizer
 #   make demo                   # build README demo GIF (docs/demo.gif)
 #   make lint test typecheck    # basic quality checks
 
@@ -21,7 +21,7 @@ help:
 	@echo "  make train"
 	@echo "  make predict FILE=path/to.wav"
 	@echo "  make stream [DEVICE=substring or index]"
-	@echo "  make vis [FOLDS=10]"
+	@echo "  make vis [SPLIT=test]"
 	@echo "  make demo"
 	@echo "  make lint | test | typecheck"
 
@@ -42,9 +42,9 @@ train:
 	$(ACT)
 	export PYTHONPATH=.
 	$(PY) train.py \
-	  --data_root ../data/UrbanSound8K \
-	  --train_folds 1,2,3,4,5,6,7,8,9 \
-	  --val_folds 10 \
+	  --data_root ../data/GTZAN \
+	  --train_ratio 0.8 \
+	  --val_ratio 0.1 \
 	  --batch_size 16 \
 	  --epochs 5 \
 	  --model smallcnn
@@ -56,7 +56,7 @@ predict:
 	export PYTHONPATH=.
 	$(PY) predict.py \
 	  --wav "$(FILE)" \
-	  --data_root ../data/UrbanSound8K \
+	  --data_root ../data/GTZAN \
 	  --checkpoint artifacts/best_model.pt \
 	  --model smallcnn \
 	  --topk 5 \
@@ -67,7 +67,7 @@ stream:
 	$(ACT)
 	export PYTHONPATH=.
 	$(PY) scripts/stream_infer.py \
-	  --data_root ../data/UrbanSound8K \
+	  --data_root ../data/GTZAN \
 	  --checkpoint artifacts/best_model.pt \
 	  --model smallcnn \
 	  --hop_sec 0.25 \
@@ -78,8 +78,8 @@ vis:
 	$(ACT)
 	export PYTHONPATH=.
 	$(PY) scripts/vis_dataset.py \
-	  --data_root ../data/UrbanSound8K \
-	  --folds $(if $(FOLDS),$(FOLDS),10) \
+	  --data_root ../data/GTZAN \
+	  --split $(if $(SPLIT),$(SPLIT),test) \
 	  --checkpoint artifacts/best_model.pt \
 	  --model smallcnn \
 	  --spec_auto_gain \
@@ -91,8 +91,8 @@ demo:
 	$(ACT)
 	export PYTHONPATH=.
 	$(PY) scripts/gen_demo_gif.py \
-	  --data_root ../data/UrbanSound8K \
-	  --inputs ../data/UrbanSound8K/audio/fold10 \
+	  --data_root ../data/GTZAN \
+	  --inputs ../data/GTZAN/blues \
 	  --checkpoint artifacts/best_model.pt \
 	  --model smallcnn \
 	  --out docs/demo.gif \

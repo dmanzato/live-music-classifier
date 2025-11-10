@@ -5,29 +5,29 @@ and Top-K predictions. The Top-1 prediction is shown in the figure title.
 
 USAGE EXAMPLES:
   # List available audio input devices
-  live-audio-stream --list-devices
+  live-music-stream --list-devices
   # or: python scripts/stream_infer.py --list-devices
 
   # Minimal (uses default device, model, and checkpoint path)
-  live-audio-stream \
-      --data_root /path/to/UrbanSound8K \
+  live-music-stream \
+      --data_root /path/to/GTZAN \
       --checkpoint artifacts/best_model.pt
 
   # Pick a microphone by substring and faster refresh
-  live-audio-stream \
-      --data_root /path/to/UrbanSound8K \
+  live-music-stream \
+      --data_root /path/to/GTZAN \
       --checkpoint artifacts/best_model.pt \
       --device "MacBook Pro Microphone" \
       --hop_sec 0.20
 
   # Tweak spectrogram auto-gain percentiles
-  live-audio-stream \
-      --data_root /path/to/UrbanSound8K \
+  live-music-stream \
+      --data_root /path/to/GTZAN \
       --checkpoint artifacts/best_model.pt \
       --spec_pmin 3 --spec_pmax 97
 
 TIPS
-- After pip install, use the `live-audio-stream` command (no PYTHONPATH needed)
+- After pip install, use the `live-music-stream` command (no PYTHONPATH needed)
 - Use --list-devices to see available microphones
 - Use --device <index> or --device '<substring>' to select a specific device
 """
@@ -79,7 +79,7 @@ def main():
 
     # Model parameters
     ap.add_argument("--data_root", type=str, required=True,
-                    help="Path to UrbanSound8K root (used to resolve class names if class_map.json not present).")
+                    help="Path to GTZAN root directory (used to resolve class names if class_map.json not present).")
     ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt",
                     help="Path to the trained model weights. [default: artifacts/best_model.pt]")
     ap.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"],

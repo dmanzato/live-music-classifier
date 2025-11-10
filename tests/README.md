@@ -1,6 +1,6 @@
 # Tests
 
-This directory contains unit tests for the live-audio-classifier project.
+This directory contains unit tests for the live-music-classifier project.
 
 ## Running Tests
 
@@ -39,7 +39,7 @@ pytest tests/ -v
 
 - `test_models.py`: Tests for model architectures (SmallCNN)
 - `test_transforms.py`: Tests for audio transforms (mel spectrogram, SpecAugment)
-- `test_dataset.py`: Tests for dataset loading (UrbanSound8K)
+- `test_dataset.py`: Tests for dataset loading (GTZAN)
 - `test_utils.py`: Tests for utility functions
 - `conftest.py`: Pytest fixtures and configuration
 

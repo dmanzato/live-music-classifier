@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Visualize UrbanSound8K dataset files (no microphone), with audio playback and keyboard controls.
+Visualize GTZAN dataset files (no microphone), with audio playback and keyboard controls.
 Now uses SoundFile (libsndfile) + SciPy for audio loading/resampling to avoid torchcodec.
 
 Features
-- Loads from dataset folds (same preprocessing as training: resample + pad/trim)
+- Loads from dataset split (same preprocessing as training: resample + pad/trim)
 - Displays live-updating log-mel spectrogram
 - Shows ground-truth label + model Top-K predictions
 - Plays the exact audio window that produced the spectrogram
@@ -19,8 +19,8 @@ Features
 Usage:
   export PYTHONPATH=.
   python scripts/vis_dataset.py \
-    --data_root ../data/UrbanSound8K \
-    --folds 10 \
+    --data_root ../data/GTZAN \
+    --split test \
     --checkpoint artifacts/best_model.pt \
     --model smallcnn \
     --spec_auto_gain \
@@ -43,7 +43,7 @@ import torchaudio  # still used by your dataset; playback loader doesn't rely on
 # Ensure local imports resolve even if a PyPI package named "transforms" exists
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets.urbansound8k import UrbanSound8K
+from datasets.gtzan import GTZAN
 from utils.device import get_device
 from utils.models import build_model
 
@@ -58,30 +58,14 @@ from scipy.signal import resample_poly
 
 
 def load_id_to_name(data_root: Path):
-    """Reads UrbanSound8K.csv to map classID -> class name"""
-    import pandas as pd
-
-    meta1 = data_root / "UrbanSound8K.csv"
-    meta2 = data_root / "metadata" / "UrbanSound8K.csv"
-
-    if meta1.exists():
-        meta_path = meta1
-    elif meta2.exists():
-        meta_path = meta2
-    else:
-        raise FileNotFoundError("UrbanSound8K.csv not found in data_root or data_root/metadata")
-
-    df = pd.read_csv(meta_path)
-    id_to_name = (
-        df[["classID", "class"]]
-        .drop_duplicates(subset=["classID"])
-        .set_index("classID")["class"]
-        .to_dict()
-    )
+    """Loads GTZAN genre names from dataset structure"""
+    from datasets.gtzan import GTZAN_GENRES
+    # GTZAN uses genre folder names as class names
+    id_to_name = {i: genre for i, genre in enumerate(GTZAN_GENRES)}
     return id_to_name
 
 
-def idx_to_name(dataset: UrbanSound8K, y_idx: int, id_to_name: dict):
+def idx_to_name(dataset: GTZAN, y_idx: int, id_to_name: dict):
     """
     Convert dataset's numeric label -> readable class name.
 
@@ -165,9 +149,11 @@ class Viewer:
 
         # Dataset
         self.data_root = Path(args.data_root)
-        self.ds = UrbanSound8K(
+        self.ds = GTZAN(
             root=str(self.data_root),
-            folds=[int(f) for f in args.folds.split(",") if f.strip()],
+            split=args.split,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
             target_sr=args.sr,
             duration=args.duration,
             augment=None,  # no augmentation for visualization
@@ -333,9 +319,14 @@ class Viewer:
 # Main
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser("Visualize UrbanSound8K spectrogram + labels (from dataset) with keyboard controls")
+    parser = argparse.ArgumentParser("Visualize GTZAN spectrogram + labels (from dataset) with keyboard controls")
     parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--folds", type=str, default="10", help="Which folds to visualize, e.g. '10' or '1,2,3'")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test", "all"],
+                        help="Which split to visualize [default: test]")
+    parser.add_argument("--train_ratio", type=float, default=0.8,
+                        help="Proportion of data for training (must match training) [default: 0.8]")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Proportion of data for validation (must match training) [default: 0.1]")
     parser.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt")
     parser.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"])
     parser.add_argument("--topk", type=int, default=5)
@@ -343,7 +334,7 @@ def main():
                         help="Auto-adjust spectrogram color scale per frame using 5-95th percentile")
     parser.add_argument("--sleep", type=float, default=0.6, help="Pause between samples when auto-advancing")
     parser.add_argument("--sr", type=int, default=16000, help="Target sample rate to match training")
-    parser.add_argument("--duration", type=float, default=4.0, help="Seconds per clip (pad/trim to this)")
+    parser.add_argument("--duration", type=float, default=30.0, help="Seconds per clip (pad/trim to this, GTZAN uses 30s)")
     parser.add_argument("--play_audio", action="store_true", help="Play the audio for each item")
     parser.add_argument("--out_device", type=str, default=None, help="Sound output device index or substring")
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""Logging utilities for live-audio-classifier."""
+"""Logging utilities for live-music-classifier."""
 import logging
 import sys
 from pathlib import Path
@@ -15,7 +15,7 @@ def setup_logging(level=logging.INFO, log_file=None):
     Returns:
         Configured logger instance.
     """
-    logger = logging.getLogger("live_audio_classifier")
+    logger = logging.getLogger("live_music_classifier")
     logger.setLevel(level)
     
     # Remove existing handlers to avoid duplicates
@@ -50,12 +50,12 @@ def get_logger(name=None):
     Get a logger instance.
     
     Args:
-        name: Logger name. If None, returns the default 'live_audio_classifier' logger.
+        name: Logger name. If None, returns the default 'live_music_classifier' logger.
     
     Returns:
         Logger instance.
     """
     if name:
-        return logging.getLogger(f"live_audio_classifier.{name}")
-    return logging.getLogger("live_audio_classifier")
+        return logging.getLogger(f"live_music_classifier.{name}")
+    return logging.getLogger("live_music_classifier")
 

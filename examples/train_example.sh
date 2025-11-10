@@ -1,10 +1,10 @@
 #!/bin/bash
 # Example training script
 # 
-# This script demonstrates how to train a model on UrbanSound8K.
+# This script demonstrates how to train a model on GTZAN.
 # Update DATA_ROOT with your actual dataset path.
 
-DATA_ROOT="${DATA_ROOT:-/path/to/UrbanSound8K}"
+DATA_ROOT="${DATA_ROOT:-/path/to/GTZAN}"
 
 if [ ! -d "$DATA_ROOT" ]; then
     echo "Error: Data root not found: $DATA_ROOT"
@@ -15,8 +15,8 @@ fi
 echo "Training SmallCNN model..."
 python train.py \
     --data_root "$DATA_ROOT" \
-    --train_folds 1,2,3,4,5,6,7,8,9 \
-    --val_folds 10 \
+    --train_ratio 0.8 \
+    --val_ratio 0.1 \
     --batch_size 16 \
     --epochs 5 \
     --model smallcnn \

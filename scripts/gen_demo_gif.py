@@ -6,10 +6,10 @@ Generate a short README demo GIF (docs/demo.gif) showing:
 
 Usage (examples):
 
-  # Using UrbanSound8K fold 10 (change as needed)
+  # Using GTZAN test split (change as needed)
   PYTHONPATH=. python scripts/gen_demo_gif.py \
-    --data_root ../data/UrbanSound8K \
-    --inputs UrbanSound8K/audio/fold10 \
+    --data_root ../data/GTZAN \
+    --inputs GTZAN/blues \
     --checkpoint artifacts/best_model.pt \
     --model smallcnn \
     --out docs/demo.gif \
@@ -68,14 +68,14 @@ def read_mono_resampled(path: Path, target_sr: int, duration: float):
 
 def main():
     ap = argparse.ArgumentParser("Generate README demo GIF")
-    ap.add_argument("--data_root", type=str, default=".", help="UrbanSound8K root (for class names)")
+    ap.add_argument("--data_root", type=str, default=".", help="GTZAN root directory (for class names)")
     ap.add_argument("--inputs", type=str, required=True,
-                    help="Directory or glob of WAV files; e.g., 'UrbanSound8K/audio/fold10' or 'examples'")
+                    help="Directory or glob of WAV files; e.g., 'GTZAN/blues' or 'examples'")
     ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt")
     ap.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"])
     ap.add_argument("--out", type=str, default="docs/demo.gif")
     ap.add_argument("--sr", type=int, default=16000)
-    ap.add_argument("--duration", type=float, default=4.0, help="seconds per clip")
+    ap.add_argument("--duration", type=float, default=30.0, help="seconds per clip (GTZAN uses 30s)")
     ap.add_argument("--n_mels", type=int, default=64)
     ap.add_argument("--n_fft", type=int, default=1024)
     ap.add_argument("--hop_length", type=int, default=256)

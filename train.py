@@ -12,7 +12,7 @@ from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
 import matplotlib.pyplot as plt
 
-from datasets.urbansound8k import UrbanSound8K
+from datasets.gtzan import GTZAN
 from transforms.audio import SpecAugment
 from utils.logging import setup_logging, get_logger
 from utils.device import get_device, get_device_name
@@ -91,10 +91,10 @@ def main():
     # Setup logging
     setup_logging(level=logging.INFO)
     
-    ap = argparse.ArgumentParser(description="Train audio classification model on UrbanSound8K")
-    ap.add_argument("--data_root", type=str, required=True, help="Path to UrbanSound8K root")
-    ap.add_argument("--train_folds", type=str, default="1,2,3,4,5,6,7,8,9", help="Comma-separated fold numbers for training")
-    ap.add_argument("--val_folds", type=str, default="10", help="Comma-separated fold numbers for validation")
+    ap = argparse.ArgumentParser(description="Train audio classification model on GTZAN")
+    ap.add_argument("--data_root", type=str, required=True, help="Path to GTZAN root directory")
+    ap.add_argument("--train_ratio", type=float, default=0.8, help="Proportion of data for training (default: 0.8)")
+    ap.add_argument("--val_ratio", type=float, default=0.1, help="Proportion of data for validation (default: 0.1)")
     ap.add_argument("--batch_size", type=int, default=16, help="Batch size")
     ap.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     ap.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
@@ -127,15 +127,12 @@ def main():
     device = get_device()
     logger.info(f"Using device: {get_device_name()} ({device})")
 
-    # Parse folds
-    try:
-        train_folds = [int(x.strip()) for x in args.train_folds.split(",") if x.strip()]
-        val_folds = [int(x.strip()) for x in args.val_folds.split(",") if x.strip()]
-    except ValueError as e:
-        logger.error(f"Invalid fold specification: {e}")
+    # Validate split ratios
+    if args.train_ratio + args.val_ratio >= 1.0:
+        logger.error(f"train_ratio + val_ratio must be < 1.0 (got {args.train_ratio + args.val_ratio})")
         sys.exit(1)
     
-    logger.info(f"Training folds: {train_folds}, Validation folds: {val_folds}")
+    logger.info(f"Train ratio: {args.train_ratio}, Val ratio: {args.val_ratio}, Test ratio: {1.0 - args.train_ratio - args.val_ratio}")
     
     # Setup augmentation
     augment = SpecAugment() if args.use_specaug else None
@@ -145,9 +142,11 @@ def main():
     # Load datasets
     try:
         logger.info("Loading training dataset...")
-        train_ds = UrbanSound8K(
+        train_ds = GTZAN(
             root=str(data_root),
-            folds=train_folds,
+            split='train',
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
             target_sr=args.sr,
             duration=args.duration,
             n_mels=args.n_mels,
@@ -156,9 +155,11 @@ def main():
             augment=augment,
         )
         logger.info("Loading validation dataset...")
-        val_ds = UrbanSound8K(
+        val_ds = GTZAN(
             root=str(data_root),
-            folds=val_folds,
+            split='val',
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
             target_sr=args.sr,
             duration=args.duration,
             n_mels=args.n_mels,
@@ -170,7 +171,7 @@ def main():
         logger.error(f"Error loading datasets: {e}", exc_info=True)
         sys.exit(1)
     
-    num_classes = len(train_ds.class_ids)
+    num_classes = len(train_ds.GENRES)
     logger.info(f"Classes: {num_classes} | Train items: {len(train_ds)} | Val items: {len(val_ds)}")
 
     # Create data loaders
@@ -193,6 +194,11 @@ def main():
         logger.error(f"Error creating data loaders: {e}", exc_info=True)
         sys.exit(1)
     
+    # Create artifacts directory
+    artifacts_dir = Path("artifacts")
+    artifacts_dir.mkdir(exist_ok=True)
+    logger.info(f"Artifacts directory: {artifacts_dir.absolute()}")
+    
     # Build model
     try:
         model = build_model(args.model, num_classes).to(device)
@@ -211,11 +217,6 @@ def main():
     opt = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.CrossEntropyLoss()
     logger.info(f"Optimizer: Adam, Learning rate: {args.lr}")
-    
-    # Create artifacts directory
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
-    logger.info(f"Artifacts directory: {artifacts_dir.absolute()}")
     
     best_f1 = -1.0
     logger.info(f"Starting training for {args.epochs} epochs...")

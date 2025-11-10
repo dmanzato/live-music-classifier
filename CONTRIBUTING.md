@@ -1,11 +1,11 @@
-# Contributing to live-audio-classifier
+# Contributing to live-music-classifier
 
 Thank you for your interest in contributing! This document provides guidelines and instructions for contributing.
 
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/dmanzato/live-audio-classifier.git`
+2. Clone your fork: `git clone https://github.com/dmanzato/live-music-classifier.git`
 3. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
 4. Install dependencies: `pip install -r requirements.txt`
 5. Install in development mode: `pip install -e .`

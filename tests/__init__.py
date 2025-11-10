@@ -1,2 +1,2 @@
-# Tests for live-audio-classifier
+# Tests for live-music-classifier
 

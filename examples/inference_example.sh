@@ -4,7 +4,7 @@
 # This script demonstrates how to run inference on an audio file.
 # Update DATA_ROOT and AUDIO_FILE with your paths.
 
-DATA_ROOT="${DATA_ROOT:-/path/to/UrbanSound8K}"
+DATA_ROOT="${DATA_ROOT:-/path/to/GTZAN}"
 AUDIO_FILE="${1:-/path/to/your_audio.wav}"
 
 if [ ! -d "$DATA_ROOT" ]; then

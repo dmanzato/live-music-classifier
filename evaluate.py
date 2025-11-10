@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Evaluate and compare model performance on UrbanSound8K test set.
+Evaluate and compare model performance on GTZAN test set.
 
-This script loads trained models and evaluates them on a test fold,
+This script loads trained models and evaluates them on a test split,
 computing accuracy, macro F1, per-class F1, and confusion matrices.
 """
 
@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report, con
 import numpy as np
 import pandas as pd
 
-from datasets.urbansound8k import UrbanSound8K
+from datasets.gtzan import GTZAN
 from utils.device import get_device, get_device_name
 from utils.logging import setup_logging, get_logger
 from utils.models import build_model
@@ -78,12 +78,14 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, c
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate and compare model performance on UrbanSound8K test set"
+        description="Evaluate and compare model performance on GTZAN test set"
     )
     parser.add_argument("--data_root", type=str, required=True,
-                       help="Path to UrbanSound8K root directory")
-    parser.add_argument("--test_folds", type=str, default="10",
-                       help="Comma-separated fold numbers for testing [default: 10]")
+                       help="Path to GTZAN root directory")
+    parser.add_argument("--train_ratio", type=float, default=0.8,
+                       help="Proportion of data for training (must match training) [default: 0.8]")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                       help="Proportion of data for validation (must match training) [default: 0.1]")
     parser.add_argument("--checkpoint_smallcnn", type=str,
                        default="artifacts/best_model_smallcnn.pt",
                        help="Path to SmallCNN checkpoint. If not found, tries artifacts/best_model.pt")
@@ -109,9 +111,13 @@ def main():
     device = get_device()
     logger.info(f"Using device: {get_device_name()} ({device})")
     
-    # Parse test folds
-    test_folds = [int(f.strip()) for f in args.test_folds.split(",")]
-    logger.info(f"Test folds: {test_folds}")
+    # Validate split ratios
+    if args.train_ratio + args.val_ratio >= 1.0:
+        logger.error(f"train_ratio + val_ratio must be < 1.0 (got {args.train_ratio + args.val_ratio})")
+        sys.exit(1)
+    
+    test_ratio = 1.0 - args.train_ratio - args.val_ratio
+    logger.info(f"Using splits - Train: {args.train_ratio}, Val: {args.val_ratio}, Test: {test_ratio}")
     
     # Load test dataset
     data_root = Path(args.data_root)
@@ -120,9 +126,11 @@ def main():
         sys.exit(1)
     
     logger.info("Loading test dataset...")
-    test_ds = UrbanSound8K(
+    test_ds = GTZAN(
         root=str(data_root),
-        folds=test_folds,
+        split='test',
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
         target_sr=args.sr,
         duration=args.duration,
         n_mels=args.n_mels,
@@ -139,7 +147,7 @@ def main():
         pin_memory=True
     )
     
-    num_classes = len(test_ds.class_ids)
+    num_classes = len(test_ds.GENRES)
     class_names = [test_ds.idx2name[i] for i in range(num_classes)]
     
     logger.info(f"Test dataset: {len(test_ds)} samples, {num_classes} classes")

@@ -1,14 +1,14 @@
 
-# live-audio-classifier
+# live-music-classifier
 
-Real-time environmental sound classification with **PyTorch**: microphone or dataset playback → **log-mel spectrogram** → **CNN** → **live Top-K predictions** (with a clean UI and keyboard controls).
+Real-time music genre classification with **PyTorch**: microphone or dataset playback → **log-mel spectrogram** → **CNN** → **live Top-K predictions** (with a clean UI and keyboard controls).
 
-[![CI](https://img.shields.io/github/actions/workflow/status/dmanzato/live-audio-classifier/ci.yml?branch=main)](../../actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/dmanzato/live-music-classifier/ci.yml?branch=main)](../../actions)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-%F0%9F%AA%80-orange)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
-**Repository**: [https://github.com/dmanzato/live-audio-classifier](https://github.com/dmanzato/live-audio-classifier)
+**Repository**: [https://github.com/dmanzato/live-music-classifier](https://github.com/dmanzato/live-music-classifier)
 
 > **Demo**  
 > ![live spectrogram + predictions](docs/demo.gif)  
@@ -17,9 +17,9 @@ Real-time environmental sound classification with **PyTorch**: microphone or dat
 
 ## Project Overview
 
-This project provides a complete pipeline for **environmental sound classification**:
+This project provides a complete pipeline for **music genre classification**:
 
-- **Training**: Train CNN models (SmallCNN or ResNet18) on **UrbanSound8K** with optional data augmentation  
+- **Training**: Train CNN models (SmallCNN or ResNet18) on **GTZAN** with optional data augmentation  
 - **Inference**: Classify audio files with **Top-K predictions** and **spectrogram** visualization  
 - **Live Streaming**: Real-time **microphone input** with **live spectrogram** and predictions  
 - **Visualization**: Interactive dataset browser with ground truth **vs** predictions
@@ -36,7 +36,7 @@ This project provides a complete pipeline for **environmental sound classificati
 ### Project Structure
 
 ```
-live-audio-classifier/
+live-music-classifier/
 ├── train.py              # Main training script
 ├── predict.py            # Single-file inference
 ├── evaluate.py           # Model evaluation and comparison
@@ -44,7 +44,7 @@ live-audio-classifier/
 ├── models/
 │   └── small_cnn.py      # CNN architecture
 ├── datasets/
-│   └── urbansound8k.py   # Dataset loader
+│   └── gtzan.py          # Dataset loader
 ├── transforms/
 │   └── audio.py          # Audio preprocessing & augmentation
 ├── utils/
@@ -69,10 +69,10 @@ live-audio-classifier/
 - Input: `[B, 1, n_mels, time]` log-mel spectrograms
 - Output: Class logits
 
-**Dataset** (`datasets/urbansound8k.py`):
-- `UrbanSound8K`: PyTorch Dataset loader
+**Dataset** (`datasets/gtzan.py`):
+- `GTZAN`: PyTorch Dataset loader
 - Handles audio loading, resampling, padding/trimming, and log-mel conversion
-- Maps classID to contiguous indices
+- Maps genre folders to contiguous indices (10 genres: blues, classical, country, disco, hiphop, jazz, metal, pop, reggae, rock)
 
 **Transforms** (`transforms/audio.py`):
 - `get_mel_transform()`: Creates MelSpectrogram transform
@@ -95,12 +95,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 
 # Now you can use CLI commands:
-live-audio-train --help
-live-audio-predict --help
-live-audio-stream --help
+live-music-train --help
+live-music-predict --help
+live-music-stream --help
 ```
 
-This installs the package and makes the CLI commands (`live-audio-train`, `live-audio-predict`, `live-audio-stream`) available system-wide in your virtual environment.
+This installs the package and makes the CLI commands (`live-music-train`, `live-music-predict`, `live-music-stream`) available system-wide in your virtual environment.
 
 ### Option 2: Install dependencies only
 
@@ -132,15 +132,15 @@ python demo_shapes.py
 
 **Using CLI Commands** (if installed as package):
 ```bash
-live-audio-train --data_root /path/to/UrbanSound8K --epochs 1 --model smallcnn
-live-audio-predict --wav /path/to/audio.wav --data_root /path/to/UrbanSound8K
-live-audio-stream --list-devices
+live-music-train --data_root /path/to/GTZAN --epochs 1 --model smallcnn
+live-music-predict --wav /path/to/audio.wav --data_root /path/to/GTZAN
+live-music-stream --list-devices
 ```
 
 **Using Python directly** (if dependencies only):
 ```bash
-python train.py --data_root /path/to/UrbanSound8K --epochs 1 --model smallcnn
-python predict.py --wav /path/to/audio.wav --data_root /path/to/UrbanSound8K
+python train.py --data_root /path/to/GTZAN --epochs 1 --model smallcnn
+python predict.py --wav /path/to/audio.wav --data_root /path/to/GTZAN
 python scripts/stream_infer.py --list-devices
 ```
 
@@ -157,7 +157,7 @@ The project includes a `Makefile` with convenient shortcuts for common tasks. Af
 # Setup virtual environment and install dependencies
 make setup
 
-# Train a model (uses default folds and parameters)
+# Train a model (uses default split ratios and parameters)
 make train
 
 # Run inference on a WAV file
@@ -170,8 +170,8 @@ make stream DEVICE="MacBook Pro Microphone"
 
 # Visualize dataset samples
 make vis
-# Or with specific folds:
-make vis FOLDS=1,2,3
+# Or with specific split:
+make vis SPLIT=test
 
 # Generate demo GIF for README
 make demo
@@ -186,32 +186,39 @@ All Makefile targets activate the virtual environment automatically. See `Makefi
 
 ---
 
-## Train on UrbanSound8K
+## Train on GTZAN
 
-> **Note**: If you installed the package (`pip install -e .`), you can use `live-audio-train` instead of `python train.py`.
+> **Note**: If you installed the package (`pip install -e .`), you can use `live-music-train` instead of `python train.py`.
 
-1) Download **UrbanSound8K** and point `--data_root` to its root directory.
+1) Download **GTZAN** and point `--data_root` to its root directory.
 
 Expected layout:
 ```
-UrbanSound8K/
-├── audio/
-│   ├── fold1/*.wav
-│   ├── ...
-│   └── fold10/*.wav
-└── metadata/UrbanSound8K.csv
+GTZAN/
+├── blues/
+│   ├── blues.00000.wav
+│   └── ...
+├── classical/
+├── country/
+├── disco/
+├── hiphop/
+├── jazz/
+├── metal/
+├── pop/
+├── reggae/
+└── rock/
 ```
 
 2) Example run:
 
 ```bash
-python train.py   --data_root /path/to/UrbanSound8K   --train_folds 1,2,3,4,5,6,7,8,9   --val_folds 10   --batch_size 16   --epochs 5   --model smallcnn   --use_specaug
+python train.py   --data_root /path/to/GTZAN   --train_ratio 0.8   --val_ratio 0.1   --batch_size 16   --epochs 5   --model smallcnn   --use_specaug
 ```
 
 Switch to ResNet18:
 
 ```bash
-python train.py   --data_root /path/to/UrbanSound8K   --train_folds 1,2,3,4,5,6,7,8,9   --val_folds 10   --batch_size 16   --epochs 5   --model resnet18
+python train.py   --data_root /path/to/GTZAN   --train_ratio 0.8   --val_ratio 0.1   --batch_size 16   --epochs 5   --model resnet18
 ```
 
 After each epoch you'll get:
@@ -225,15 +232,15 @@ After each epoch you'll get:
 
 ## Inference on your own WAVs
 
-> **Note**: If you installed the package (`pip install -e .`), you can use `live-audio-predict` instead of `python predict.py`.
+> **Note**: If you installed the package (`pip install -e .`), you can use `live-music-predict` instead of `python predict.py`.
 
 ```bash
 # Uses artifacts/best_model.pt by default
-python predict.py   --wav /path/to/your_sound.wav   --data_root /path/to/UrbanSound8K   --model smallcnn   --topk 5   --out_dir pred_artifacts
+python predict.py   --wav /path/to/your_music.wav   --data_root /path/to/GTZAN   --model smallcnn   --topk 5   --out_dir pred_artifacts
 ```
 
 - Saves `pred_artifacts/spectrogram.png`  
-- Class names are loaded from `artifacts/class_map.json` (created automatically by `train.py`), or fallback to UrbanSound8K metadata CSV if not found.
+- Class names are loaded from `artifacts/class_map.json` (created automatically by `train.py`), or fallback to GTZAN genre folders if not found.
 
 ---
 
@@ -251,16 +258,16 @@ List audio devices:
 python scripts/record_wav.py --list-devices
 ```
 
-Record 4 seconds to WAV (mono, 16kHz):
+Record 30 seconds to WAV (mono, 16kHz) - GTZAN uses 30-second clips:
 
 ```bash
-python scripts/record_wav.py --out my_clip.wav --seconds 4 --sr 16000 --channels 1
+python scripts/record_wav.py --out my_clip.wav --seconds 30 --sr 16000 --channels 1
 ```
 
 Then run inference on what you recorded:
 
 ```bash
-python predict.py --wav my_clip.wav   --data_root /path/to/UrbanSound8K
+python predict.py --wav my_clip.wav   --data_root /path/to/GTZAN
 ```
 
 **macOS**: If you get an input-permission error, go to *System Settings → Privacy & Security → Microphone* and allow Terminal/iTerm access.
@@ -273,15 +280,15 @@ Real-time microphone input with **live spectrogram** and **Top-K predictions**.
 
 ```bash
 # Using the CLI command (after pip install)
-live-audio-stream   --data_root /path/to/UrbanSound8K   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 4.0   --hop_sec 0.25   --topk 5
+live-music-stream   --data_root /path/to/GTZAN   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 30.0   --hop_sec 0.25   --topk 5
 
 # Or using Python directly
-python scripts/stream_infer.py   --data_root /path/to/UrbanSound8K   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 4.0   --hop_sec 0.25   --topk 5
+python scripts/stream_infer.py   --data_root /path/to/GTZAN   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 30.0   --hop_sec 0.25   --topk 5
 ```
 
 **Features**
 
-- Rolling window buffer (default 4 seconds)  
+- Rolling window buffer (default 30 seconds for GTZAN)  
 - Live spectrogram visualization with **auto-scaling**  
 - Top-K predictions with bar chart  
 - **EMA smoothing** of predictions  
@@ -291,7 +298,7 @@ python scripts/stream_infer.py   --data_root /path/to/UrbanSound8K   --checkpoin
 
 List available audio input devices:
 ```bash
-live-audio-stream --list-devices
+live-music-stream --list-devices
 # or
 python scripts/stream_infer.py --list-devices
 ```
@@ -305,7 +312,7 @@ Use `--device <index>` or `--device '<substring>'` to pick a specific microphone
 Interactive viewer for browsing dataset samples with predictions:
 
 ```bash
-python scripts/vis_dataset.py   --data_root /path/to/UrbanSound8K   --folds 10   --checkpoint artifacts/best_model.pt   --model smallcnn   --spec_auto_gain   --play_audio
+python scripts/vis_dataset.py   --data_root /path/to/GTZAN   --split test   --checkpoint artifacts/best_model.pt   --model smallcnn   --spec_auto_gain   --play_audio
 ```
 
 **Keyboard Controls**
@@ -323,7 +330,7 @@ python scripts/vis_dataset.py   --data_root /path/to/UrbanSound8K   --folds 10  
 ### Main Scripts
 
 #### `train.py`
-Main training script. Trains models on UrbanSound8K with fold-based train/val splits. Supports both SmallCNN and ResNet18 with optional SpecAugment.
+Main training script. Trains models on GTZAN with train/val/test splits. Supports both SmallCNN and ResNet18 with optional SpecAugment.
 
 #### `predict.py`
 Single-file inference. Classifies a WAV file and outputs Top-K predictions with probabilities. Saves spectrogram visualization.
@@ -363,7 +370,7 @@ See the [examples/](examples/) directory for:
 
 ## Why this repo?
 
-Most UrbanSound8K examples stop at “train offline & classify WAVs.”  
+Most GTZAN examples stop at "train offline & classify WAVs."  
 This project also provides **real-time microphone streaming**, **live spectrogram visualization**, **keyboard controls**, and **dataset playback with synchronized audio**, all in a minimal, hackable codebase.
 
 ```
@@ -378,9 +385,10 @@ Compare model performance on a test set:
 
 ```bash
 # Evaluate both models (requires trained checkpoints)
-live-audio-evaluate \
-    --data_root /path/to/UrbanSound8K \
-    --test_folds 10 \
+live-music-evaluate \
+    --data_root /path/to/GTZAN \
+    --train_ratio 0.8 \
+    --val_ratio 0.1 \
     --checkpoint_smallcnn artifacts/best_model_smallcnn.pt \
     --checkpoint_resnet18 artifacts/best_model_resnet18.pt \
     --output results.csv
@@ -389,8 +397,8 @@ live-audio-evaluate \
 Or evaluate a single model:
 
 ```bash
-live-audio-evaluate \
-    --data_root /path/to/UrbanSound8K \
+live-music-evaluate \
+    --data_root /path/to/GTZAN \
     --models smallcnn \
     --checkpoint_smallcnn artifacts/best_model.pt
 ```
@@ -407,15 +415,15 @@ The script outputs a comparison table when evaluating multiple models, showing w
 **Note**: To compare both models, train each separately and save with different checkpoint names:
 ```bash
 # Train SmallCNN
-live-audio-train --data_root /path/to/UrbanSound8K --model smallcnn --epochs 10
+live-music-train --data_root /path/to/GTZAN --model smallcnn --epochs 10
 mv artifacts/best_model.pt artifacts/best_model_smallcnn.pt
 
 # Train ResNet18
-live-audio-train --data_root /path/to/UrbanSound8K --model resnet18 --epochs 10
+live-music-train --data_root /path/to/GTZAN --model resnet18 --epochs 10
 mv artifacts/best_model.pt artifacts/best_model_resnet18.pt
 
 # Compare
-live-audio-evaluate --data_root /path/to/UrbanSound8K \
+live-music-evaluate --data_root /path/to/GTZAN \
     --checkpoint_smallcnn artifacts/best_model_smallcnn.pt \
     --checkpoint_resnet18 artifacts/best_model_resnet18.pt
 ```
