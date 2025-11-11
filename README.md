@@ -10,8 +10,13 @@ Real-time music genre classification with **PyTorch**: microphone or dataset pla
 
 **Repository**: [https://github.com/dmanzato/live-music-classifier](https://github.com/dmanzato/live-music-classifier)
 
-> **Demo**  
-> ![live spectrogram + predictions](docs/demo.gif)  
+> **Demos**  
+> 
+> **Live Streaming** (real-time microphone input):  
+> ![live streaming inference](docs/demo_stream.gif)  
+> 
+> **Dataset Visualization** (interactive browser with rolling analysis):  
+> ![dataset visualization](docs/demo_vis.gif)  
 
 ---
 
@@ -28,8 +33,8 @@ This project provides a complete pipeline for **music genre classification**:
 
 - **Model Architectures**: SmallCNN (custom lightweight CNN) and ResNet18 (adapted for 1-channel input)  
 - **Data Augmentation**: Optional SpecAugment (frequency & time masking)  
-- **Live Inference**: Real-time microphone streaming with **EMA-smoothed** predictions  
-- **Visualizations**: Spectrograms, confusion matrices, Top-K prediction bars  
+- **Live Inference**: Real-time microphone streaming with **trend line visualization**, **keyboard controls**, and **per-sample normalization**  
+- **Visualizations**: Spectrograms with auto-gain, Top-K prediction bars with percentage labels, rolling trend lines, and interactive dataset browser  
 - **Robust Audio I/O**: Uses `soundfile`/`sounddevice` (avoids torchcodec/FFmpeg dependency issues)  
 - **Multi-device**: CPU, CUDA, and Apple Silicon **MPS**
 
@@ -41,43 +46,63 @@ live-music-classifier/
 ├── predict.py            # Single-file inference
 ├── evaluate.py           # Model evaluation and comparison
 ├── demo_shapes.py        # Shape verification demo
+├── setup.py              # Package setup and CLI entry points
+├── requirements.txt      # Python dependencies
+├── Makefile              # Convenient shortcuts for common tasks
 ├── models/
-│   └── small_cnn.py      # CNN architecture
+│   └── small_cnn.py      # CNN architecture definitions
 ├── datasets/
-│   └── gtzan.py          # Dataset loader
+│   ├── gtzan.py          # GTZAN dataset loader
+│   └── urbansound8k.py   # Legacy UrbanSound8K loader (from migration)
 ├── transforms/
 │   └── audio.py          # Audio preprocessing & augmentation
 ├── utils/
 │   ├── models.py         # Shared model building utilities
 │   ├── class_map.py      # Class map loading/saving utilities
-│   ├── device.py         # Device selection utilities
+│   ├── device.py          # Device selection utilities (CPU/CUDA/MPS)
 │   └── logging.py        # Logging configuration
 ├── scripts/
-│   ├── stream_infer.py   # Live mic inference
-│   ├── vis_dataset.py    # Interactive dataset viewer
+│   ├── stream_infer.py   # Live microphone streaming inference
+│   ├── vis_dataset.py    # Interactive dataset browser with rolling analysis
 │   ├── record_wav.py     # Audio recording utility
-│   └── gen_demo_gif.py   # Demo GIF generator
+│   └── gen_demo_gif.py   # Demo GIF generator (stream & vis modes)
+├── examples/             # Example scripts and tutorials
+│   ├── train_example.sh
+│   ├── inference_example.sh
+│   ├── record_and_predict.sh
+│   ├── quick_start.py
+│   ├── live-music-classifier-tutorial.ipynb
+│   └── README.md
+├── tests/                # Test suite
+│   ├── test_dataset.py
+│   ├── test_models.py
+│   ├── test_transforms.py
+│   ├── test_utils.py
+│   └── README.md
+├── docs/                 # Documentation assets
+│   ├── demo_stream.gif   # Streaming inference demo
+│   └── demo_vis.gif      # Dataset visualization demo
 ├── artifacts/            # Training outputs (models, confusion matrices, class_map.json)
-├── pred_artifacts/       # Prediction outputs (spectrograms)
-└── requirements.txt      # Dependencies
+└── pred_artifacts/       # Prediction outputs (spectrograms, predictions)
 ```
 
 ### Core Components
 
 **Models** (`models/small_cnn.py`):
 - `SmallCNN`: Lightweight 3-layer CNN for spectrogram classification
-- Input: `[B, 1, n_mels, time]` log-mel spectrograms
+- Input: `[B, 1, n_mels, time]` log-mel spectrograms (normalized per-sample)
 - Output: Class logits
 
 **Dataset** (`datasets/gtzan.py`):
 - `GTZAN`: PyTorch Dataset loader
 - Handles audio loading, resampling, padding/trimming, and log-mel conversion
+- Validates and skips corrupted audio files automatically
 - Maps genre folders to contiguous indices (10 genres: blues, classical, country, disco, hiphop, jazz, metal, pop, reggae, rock)
 
 **Transforms** (`transforms/audio.py`):
 - `get_mel_transform()`: Creates MelSpectrogram transform
 - `wav_to_logmel()`: Converts waveform → log-mel spectrogram
-- `SpecAugment`: Frequency and time masking augmentation
+- `SpecAugment`: Frequency and time masking augmentation (optional during training)
 
 ---
 
@@ -173,7 +198,7 @@ make vis
 # Or with specific split:
 make vis SPLIT=test
 
-# Generate demo GIF for README
+# Generate demo GIFs for README (creates both demo_stream.gif and demo_vis.gif)
 make demo
 
 # Run code quality checks
@@ -209,16 +234,37 @@ GTZAN/
 └── rock/
 ```
 
-2) Example run:
+2) Example run (default parameters: sr=22050, n_mels=128, n_fft=1024, hop_length=512):
 
 ```bash
-python train.py   --data_root /path/to/GTZAN   --train_ratio 0.8   --val_ratio 0.1   --batch_size 16   --epochs 5   --model smallcnn   --use_specaug
+python train.py \
+    --data_root /path/to/GTZAN \
+    --train_ratio 0.8 \
+    --val_ratio 0.1 \
+    --batch_size 16 \
+    --epochs 5 \
+    --model smallcnn \
+    --use_specaug \
+    --sr 22050 \
+    --n_mels 128 \
+    --n_fft 1024 \
+    --hop_length 512
 ```
 
 Switch to ResNet18:
 
 ```bash
-python train.py   --data_root /path/to/GTZAN   --train_ratio 0.8   --val_ratio 0.1   --batch_size 16   --epochs 5   --model resnet18
+python train.py \
+    --data_root /path/to/GTZAN \
+    --train_ratio 0.8 \
+    --val_ratio 0.1 \
+    --batch_size 16 \
+    --epochs 5 \
+    --model resnet18 \
+    --sr 22050 \
+    --n_mels 128 \
+    --n_fft 1024 \
+    --hop_length 512
 ```
 
 After each epoch you'll get:
@@ -236,7 +282,13 @@ After each epoch you'll get:
 
 ```bash
 # Uses artifacts/best_model.pt by default
-python predict.py   --wav /path/to/your_music.wav   --data_root /path/to/GTZAN   --model smallcnn   --topk 5   --out_dir pred_artifacts
+python predict.py \
+    --wav /path/to/your_music.wav \
+    --data_root /path/to/GTZAN \
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --topk 5 \
+    --out_dir pred_artifacts
 ```
 
 - Saves `pred_artifacts/spectrogram.png`  
@@ -258,10 +310,10 @@ List audio devices:
 python scripts/record_wav.py --list-devices
 ```
 
-Record 30 seconds to WAV (mono, 16kHz) - GTZAN uses 30-second clips:
+Record 30 seconds to WAV (mono, 22050Hz by default to match model training) - GTZAN uses 30-second clips:
 
 ```bash
-python scripts/record_wav.py --out my_clip.wav --seconds 30 --sr 16000 --channels 1
+python scripts/record_wav.py --out my_clip.wav --seconds 30 --sr 22050 --channels 1
 ```
 
 Then run inference on what you recorded:
@@ -276,23 +328,37 @@ python predict.py --wav my_clip.wav   --data_root /path/to/GTZAN
 
 ## Streaming Inference (Live Microphone)
 
-Real-time microphone input with **live spectrogram** and **Top-K predictions**.
+Real-time microphone input with **live spectrogram**, **Top-K predictions**, and **trend line visualization**.
 
 ```bash
 # Using the CLI command (after pip install)
-live-music-stream   --data_root /path/to/GTZAN   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 30.0   --hop_sec 0.25   --topk 5
+live-music-stream \
+    --data_root /path/to/GTZAN \
+    --checkpoint artifacts/best_model.pt \
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
 
 # Or using Python directly
-python scripts/stream_infer.py   --data_root /path/to/GTZAN   --checkpoint artifacts/best_model.pt   --model smallcnn   --win_sec 30.0   --hop_sec 0.25   --topk 5
+python scripts/stream_infer.py \
+    --data_root /path/to/GTZAN \
+    --checkpoint artifacts/best_model.pt \
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
 ```
 
 **Features**
 
-- Rolling window buffer (default 30 seconds for GTZAN)  
-- Live spectrogram visualization with **auto-scaling**  
-- Top-K predictions with bar chart  
-- **EMA smoothing** of predictions  
-- Configurable refresh rate
+- **Rolling window buffer** (default 7.5 seconds) with configurable length  
+- **Live spectrogram** with auto-gain color scaling (percentile-based)  
+- **Top-K predictions** with horizontal bar chart and percentage labels  
+- **Trend line visualization** showing top-1 probability over time (with optional EMA smoothing)  
+- **Per-sample normalization** (mean/std) for improved model performance  
+- **Keyboard controls**: `SPACE` to pause/resume, `q` to quit  
+- **Configurable refresh rate** via `--hop_sec`
 
 **Device Selection**
 
@@ -305,23 +371,42 @@ python scripts/stream_infer.py --list-devices
 
 Use `--device <index>` or `--device '<substring>'` to pick a specific microphone.
 
+**Important**: Make sure `--win_sec` matches the `--duration` used during training. If you trained with `--duration 30.0`, use `--win_sec 30.0` for streaming.
+
 ---
 
 ## Dataset Visualization
 
-Interactive viewer for browsing dataset samples with predictions:
+Interactive viewer for browsing dataset samples with **rolling analysis windows** and **trend line visualization**:
 
 ```bash
-python scripts/vis_dataset.py   --data_root /path/to/GTZAN   --split test   --checkpoint artifacts/best_model.pt   --model smallcnn   --spec_auto_gain   --play_audio
+python scripts/vis_dataset.py \
+    --data_root /path/to/GTZAN/genres_original \
+    --split test \
+    --checkpoint artifacts/best_model.pt \
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --duration 30.0 --hold_sec 30.0 \
+    --ana_win_sec 3.0 --ana_hop_sec 0.5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --play_audio --topk 5
 ```
+
+**Features**
+
+- **Rolling analysis window**: Analyzes a sliding window (default 3.0s) over each audio clip as it plays  
+- **Trend line**: Shows top-1 prediction probability over time for the current clip  
+- **Top-K predictions** with percentage labels on horizontal bars  
+- **Ground truth vs predictions**: Color-coded title (green=correct, red=incorrect)  
+- **Audio playback**: Synchronized playback with rolling analysis updates  
+- **Auto-gain spectrogram**: Percentile-based color scaling for better visualization
 
 **Keyboard Controls**
 
-- `Space`: Pause/resume auto-advance  
 - `Left/Right`: Previous/next sample  
+- `Space`: Pause/resume auto-advance  
 - `P`: Toggle audio playback  
-- `G`: Toggle spectrogram auto-gain  
-- `Q/Esc`: Quit
+- `Q`: Quit
 
 ---
 
@@ -330,7 +415,7 @@ python scripts/vis_dataset.py   --data_root /path/to/GTZAN   --split test   --ch
 ### Main Scripts
 
 #### `train.py`
-Main training script. Trains models on GTZAN with train/val/test splits. Supports both SmallCNN and ResNet18 with optional SpecAugment.
+Main training script. Trains models on GTZAN with train/val/test splits. Supports both SmallCNN and ResNet18 with optional SpecAugment, mixup augmentation, class weight balancing, and per-sample spectrogram normalization for improved convergence.
 
 #### `predict.py`
 Single-file inference. Classifies a WAV file and outputs Top-K predictions with probabilities. Saves spectrogram visualization.
@@ -344,16 +429,16 @@ Minimal shape verification script. Tests the pipeline end-to-end: waveform → l
 ### Scripts Directory (`scripts/`)
 
 #### `scripts/stream_infer.py`
-Live streaming inference from microphone. Real-time predictions with live spectrogram and prediction bars. Features EMA smoothing and auto-scaling spectrogram colors.
+Live streaming inference from microphone. Real-time predictions with live spectrogram, Top-K prediction bars with percentage labels, and trend line visualization showing top-1 probability over time. Features per-sample normalization, auto-gain spectrogram scaling, keyboard controls (pause/resume, quit), and optional EMA smoothing for trend lines.
 
 #### `scripts/vis_dataset.py`
-Interactive dataset browser. Shows ground truth vs predictions, spectrograms, and supports audio playback with keyboard navigation.
+Interactive dataset browser with rolling analysis windows. Shows ground truth vs predictions with color-coded feedback, rolling spectrogram analysis, trend line visualization, Top-K prediction bars with percentage labels, and synchronized audio playback. Supports keyboard navigation (previous/next, pause/resume, toggle playback).
 
 #### `scripts/record_wav.py`
-Audio recording utility. Records from microphone and saves as WAV file (mono, 16kHz by default).
+Audio recording utility. Records from microphone and saves as WAV file (mono, configurable sample rate, defaults to 22050Hz to match model training).
 
 #### `scripts/gen_demo_gif.py`
-Generates an animated GIF for the README showing spectrograms and predictions. Processes multiple audio files and creates a frame-by-frame animation with Top-K predictions. Useful for creating demo visualizations.
+Generates animated GIFs for the README matching the visual style of `stream_infer.py` and `vis_dataset.py`. Supports both "stream" mode (single-file continuous) and "vis" mode (multi-file browsing). Creates frame-by-frame animations with rolling spectrograms, Top-K prediction bars with percentage labels, and trend line visualizations.
 
 ---
 
