@@ -7,48 +7,60 @@
 #   make vis [SPLIT=test]           # dataset visualizer (shuffled; 30s per song)
 #   make demo                       # build README demo GIF (docs/demo.gif)
 #   make lint test typecheck        # quality checks
-#
-# Tips:
-#   Disable shuffle:      make vis NO_SHUFFLE=1
-#   Change duration:      make vis DUR=20 HOLD=20
-#   Tweak rolling window: make vis WIN=4 HOP=0.25
-#   Change data root:     make DATA_ROOT=/path/to/GTZAN/genres_original vis
 
 SHELL := /usr/bin/env bash
 .ONESHELL:
-PY := python                                  # Python interpreter to use
-VENV := .venv                                 # Virtualenv path
-ACT := source $(VENV)/bin/activate            # Activates the venv in this shell
 
-# -------- Common defaults (override via make VAR=...) --------
-# Paths
-DATA_ROOT ?= ../data/GTZAN/genres_original     # Root folder of GTZAN dataset
-CHECKPOINT ?= artifacts/best_model.pt          # Model checkpoint to load for inference/vis
-OUT_DIR ?= pred_artifacts                      # Output dir for predict artifacts
+# System Python used to create venv
+SYS_PY ?= python
+# Virtualenv directory
+VENV ?= .venv
+# Venv Python interpreter
+PY := $(VENV)/bin/python
+# Venv pip
+PIP := $(VENV)/bin/pip
 
-# Model / feature extraction (training & inference must agree)
-MODEL ?= resnet18                              # Backbone: resnet18 | smallcnn
-SR ?= 22050                                    # Sample rate (Hz) used by the model
-N_MELS ?= 128                                  # Number of mel bins
-N_FFT ?= 1024                                  # STFT FFT size (samples)
-HOPLEN ?= 512                                  # STFT hop length (samples)
+# Root folder of GTZAN dataset
+DATA_ROOT ?= ../data/GTZAN/genres_original
+# Model checkpoint path
+CHECKPOINT ?= artifacts/best_model.pt
+# Output dir for predict artifacts
+OUT_DIR ?= pred_artifacts
 
-# Training
-EPOCHS ?= 5                                    # Default epochs for quick runs
-BATCH ?= 16                                    # Training batch size
-TRAIN_RATIO ?= 0.8                             # Train split ratio
-VAL_RATIO ?= 0.1                               # Val split ratio (test is implied)
+# Model architecture (resnet18|smallcnn)
+MODEL ?= resnet18
+# Audio sample rate (Hz)
+SR ?= 22050
+# Number of mel bins
+N_MELS ?= 128
+# FFT window size (samples)
+N_FFT ?= 1024
+# Hop length between FFT frames (samples)
+HOPLEN ?= 512
 
-# Streaming / Visualization (script params)
-DUR ?= 30.0                                    # Seconds to analyze/play per item
-HOLD ?= $(DUR)                                 # Auto-advance dwell time (defaults to DUR)
-TOPK ?= 5                                      # Top-K classes to show
-WIN ?= 3.0                                     # Analysis window length (sec)
-HOP ?= 0.5                                     # Analysis hop between updates (sec)
+# Default number of epochs
+EPOCHS ?= 5
+# Training batch size
+BATCH ?= 16
+# Train split ratio
+TRAIN_RATIO ?= 0.8
+# Validation split ratio (test implied)
+VAL_RATIO ?= 0.1
 
-SPLIT ?= test                                  # Dataset split to visualize (train|val|test|all)
+# Audio duration analyzed per song (sec)
+DUR ?= 30.0
+# How long to keep each item before auto-advance
+HOLD ?= $(DUR)
+# Top-K classes shown in bars
+TOPK ?= 5
+# Rolling analysis window length (sec)
+WIN ?= 3.0
+# Rolling analysis hop between updates (sec)
+HOP ?= 0.5
+# Dataset split to visualize (train|val|test|all)
+SPLIT ?= test
 
-# Shuffle control for vis (default: shuffle ON; pass NO_SHUFFLE=1 to disable)
+# Visualization shuffle control (default ON; disable with NO_SHUFFLE=1)
 VIS_SHUFFLE_FLAG := $(if $(NO_SHUFFLE),--no_shuffle,)
 
 .PHONY: help
@@ -62,23 +74,26 @@ help:
 	@echo "  make demo"
 	@echo "  make lint | test | typecheck"
 
+# ------------------------------------------------------------
+# SETUP
+# ------------------------------------------------------------
 $(VENV)/bin/python:
-	$(PY) -m venv $(VENV)
+	$(SYS_PY) -m venv $(VENV)
 
 .PHONY: setup
 setup: $(VENV)/bin/python
-	$(ACT)
-	pip install -U pip
-	pip install -r requirements.txt
+	$(PIP) install -U pip
+	$(PIP) install -r requirements.txt
 	# dev tools
-	pip install ruff mypy pytest soundfile scipy
-	@echo "✅ Setup complete. Activate with: source $(VENV)/bin/activate"
+	$(PIP) install ruff mypy pytest soundfile scipy
+	@echo "✅ Setup complete. Use venv python: $(PY)"
 
+# ------------------------------------------------------------
+# TRAINING
+# ------------------------------------------------------------
 .PHONY: train
 train:
-	$(ACT)
-	export PYTHONPATH=.
-	$(PY) train.py \
+	PYTHONPATH=. $(PY) train.py \
 	  --data_root "$(DATA_ROOT)" \
 	  --train_ratio $(TRAIN_RATIO) \
 	  --val_ratio $(VAL_RATIO) \
@@ -87,12 +102,13 @@ train:
 	  --model $(MODEL) \
 	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN)
 
+# ------------------------------------------------------------
+# PREDICT SINGLE FILE
+# ------------------------------------------------------------
 .PHONY: predict
 predict:
 	@if [ -z "$(FILE)" ]; then echo "Usage: make predict FILE=path/to.wav"; exit 1; fi
-	$(ACT)
-	export PYTHONPATH=.
-	$(PY) predict.py \
+	PYTHONPATH=. $(PY) predict.py \
 	  --wav "$(FILE)" \
 	  --data_root "$(DATA_ROOT)" \
 	  --checkpoint "$(CHECKPOINT)" \
@@ -101,11 +117,12 @@ predict:
 	  --topk $(TOPK) \
 	  --out_dir "$(OUT_DIR)"
 
+# ------------------------------------------------------------
+# LIVE STREAM INFERENCE
+# ------------------------------------------------------------
 .PHONY: stream
 stream:
-	$(ACT)
-	export PYTHONPATH=.
-	$(PY) scripts/stream_infer.py \
+	PYTHONPATH=. $(PY) scripts/stream_infer.py \
 	  --data_root "$(DATA_ROOT)" \
 	  --checkpoint "$(CHECKPOINT)" \
 	  --model $(MODEL) \
@@ -114,11 +131,12 @@ stream:
 	  --topk $(TOPK) \
 	  $(if $(DEVICE),--device "$(DEVICE)",)
 
+# ------------------------------------------------------------
+# DATASET VISUALIZER
+# ------------------------------------------------------------
 .PHONY: vis
 vis:
-	$(ACT)
-	export PYTHONPATH=.
-	$(PY) scripts/vis_dataset.py \
+	PYTHONPATH=. $(PY) scripts/vis_dataset.py \
 	  --data_root "$(DATA_ROOT)" \
 	  --split $(SPLIT) \
 	  --checkpoint "$(CHECKPOINT)" \
@@ -131,30 +149,52 @@ vis:
 	  --play_audio --out_latency high \
 	  $(VIS_SHUFFLE_FLAG)
 
+# ------------------------------------------------------------
+# DEMO GIF (VIS STYLE ONLY)
+# ------------------------------------------------------------
 .PHONY: demo
 demo:
-	$(ACT)
-	export PYTHONPATH=.
-	$(PY) scripts/gen_demo_gif.py \
+	PYTHONPATH=. $(PY) scripts/gen_demo_gif.py \
 	  --data_root "$(DATA_ROOT)" \
 	  --inputs "$(DATA_ROOT)/blues" \
 	  --checkpoint "$(CHECKPOINT)" \
 	  --model $(MODEL) \
 	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN) \
-	  --out docs/demo.gif \
+	  --mode vis \
+	  --duration $(DUR) --ana_win_sec $(WIN) --ana_hop_sec $(HOP) \
+	  --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+	  --out docs/demo_vis.gif \
 	  --max_files 6
 
+# ------------------------------------------------------------
+# DEMO GIFS (BOTH: VIS + STREAM)
+# ------------------------------------------------------------
+.PHONY: demo_all
+demo_all:
+	PYTHONPATH=. $(PY) scripts/gen_demo_gif.py \
+	  --data_root "$(DATA_ROOT)" \
+	  --inputs "$(DATA_ROOT)" \
+	  --checkpoint "$(CHECKPOINT)" \
+	  --model $(MODEL) \
+	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN) \
+	  --duration $(DUR) --ana_win_sec $(WIN) --ana_hop_sec $(HOP) \
+	  --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+	  --out_vis docs/demo_vis.gif \
+	  --out_stream docs/demo_stream.gif \
+	  --max_files 6
+
+# ------------------------------------------------------------
+# LINT / TEST / TYPECHECK
+# ------------------------------------------------------------
 .PHONY: lint
 lint:
-	$(ACT)
-	ruff check .
+	$(PY) -m ruff check .
 
 .PHONY: typecheck
 typecheck:
-	$(ACT)
-	mypy audio_classify scripts || true
+	# Adjust paths if your package name differs
+	$(PY) -m mypy audio_classify scripts || true
 
 .PHONY: test
 test:
-	$(ACT)
-	PYTHONPATH=. pytest -q
+	PYTHONPATH=. $(PY) -m pytest -q
