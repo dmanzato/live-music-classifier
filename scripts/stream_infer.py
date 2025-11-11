@@ -1,138 +1,171 @@
-#!/usr/bin/env python3
 """
-Live streaming inference (microphone → log-mel → model) with a live spectrogram
-and Top-K predictions. The Top-1 prediction is shown in the figure title.
+Real-time streaming genre inference from microphone / audio device.
 
-USAGE EXAMPLES:
-  # List available audio input devices
-  live-music-stream --list-devices
-  # or: python scripts/stream_infer.py --list-devices
+Keys:
+  SPACE : pause/resume
+  q     : quit
 
-  # Minimal (uses default device, model, and checkpoint path)
-  live-music-stream \
-      --data_root /path/to/GTZAN \
-      --checkpoint artifacts/best_model.pt
-
-  # Pick a microphone by substring and faster refresh
-  live-music-stream \
-      --data_root /path/to/GTZAN \
-      --checkpoint artifacts/best_model.pt \
-      --device "MacBook Pro Microphone" \
-      --hop_sec 0.20
-
-  # Tweak spectrogram auto-gain percentiles
-  live-music-stream \
-      --data_root /path/to/GTZAN \
-      --checkpoint artifacts/best_model.pt \
-      --spec_pmin 3 --spec_pmax 97
-
-TIPS
-- After pip install, use the `live-music-stream` command (no PYTHONPATH needed)
-- Use --list-devices to see available microphones
-- Use --device <index> or --device '<substring>' to select a specific device
+Example:
+  PYTHONPATH=. python scripts/stream_infer.py \
+    --data_root /Users/dmanzato/devel/data/GTZAN/genres_original \
+    --checkpoint artifacts/best_model.pt \
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --trend_len 120 --trend_ema 0.0
 """
 
 import argparse
-import os
-import sys
-import time
-from collections import deque
+import json
 from pathlib import Path
+import queue
+from collections import deque
+import sys
 
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 import sounddevice as sd
 import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
 
-# Ensure local project modules resolve over any similarly named pip packages
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from transforms.audio import get_mel_transform, wav_to_logmel  # your local transforms
-from utils.device import get_device
+from transforms.audio import get_mel_transform, wav_to_logmel
+from utils.device import get_device, get_device_name
 from utils.models import build_model
-from utils.class_map import load_class_map
+
+GTZAN_GENRES = [
+    "blues", "classical", "country", "disco", "hiphop",
+    "jazz", "metal", "pop", "reggae", "rock"
+]
 
 
-# -----------------------------
-# Core streaming app
-# -----------------------------
+# ----------------- helpers -----------------
+def _read_json_classmap(p: Path):
+    with open(p, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "idx2name" in data:
+        return data["idx2name"]
+    if isinstance(data, list):
+        return data
+    raise ValueError("Invalid class_map.json format")
+
+
+def _infer_classes_from_data_root(root: Path):
+    root = root / "genres" if (root / "genres").exists() else root
+    if not root.exists():
+        return GTZAN_GENRES
+    names = [d.name for d in root.iterdir() if d.is_dir()]
+    present = [g for g in GTZAN_GENRES if g in names]
+    return present if len(present) >= 2 else sorted(names)
+
+
+def _detect_num_classes_from_state_dict(state_dict: dict) -> int:
+    # Works for ResNet (fc.weight) and many small heads
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor) and v.ndim == 2 and k.endswith(".weight"):
+            if any(t in k for t in ("fc.", "classifier", "head")):
+                return v.shape[0]
+    # fallback: first linear-like weight
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor) and v.ndim == 2:
+            return v.shape[0]
+    return len(GTZAN_GENRES)
+
+
+def _load_checkpoint(checkpoint_path: Path, device: torch.device):
+    state = torch.load(checkpoint_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        return state["state_dict"]
+    return state
+
+
+def _compute_spec_limits(mel_img: np.ndarray, auto_gain: bool, pmin: float, pmax: float, prev=None):
+    """Compute (vmin, vmax) for the spectrogram, supporting per-frame auto-gain."""
+    if auto_gain:
+        lo = np.percentile(mel_img, pmin)
+        hi = np.percentile(mel_img, pmax)
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+            lo, hi = (mel_img.min(), mel_img.max())
+            if lo == hi:
+                hi = lo + 1e-6
+        return lo, hi
+    else:
+        if prev is None:
+            lo, hi = (mel_img.min(), mel_img.max())
+            if lo == hi:
+                hi = lo + 1e-6
+            return lo, hi
+        return prev
+
+
+# ----------------- main -----------------
 def main():
-    ap = argparse.ArgumentParser(description="Live mic → log-mel → model predictions + spectrogram")
+    ap = argparse.ArgumentParser(description="Live genre classification stream")
+    ap.add_argument("--data_root", type=str, required=True)
+    ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt")
+    ap.add_argument("--model", type=str, default="resnet18", choices=["smallcnn", "resnet18"])
 
-    # Audio capture parameters
-    ap.add_argument("--sr", type=int, default=16000,
-                    help="Microphone sample rate (Hz). Must match model's expected transforms. [default: 16000]")
-    ap.add_argument("--win_sec", type=float, default=4.0,
-                    help="Rolling window length (seconds) used for inference. [default: 4.0]")
-    ap.add_argument("--hop_sec", type=float, default=0.25,
-                    help="UI/prediction refresh interval (seconds). [default: 0.25]")
-    ap.add_argument("--device", type=str, default=None,
-                    help="Microphone device index or substring to match (e.g., 'MacBook Pro Microphone').")
-    ap.add_argument("--list-devices", action="store_true",
-                    help="List available audio input devices and exit.")
+    # audio / feature params
+    ap.add_argument("--sr", type=int, default=22050)
+    ap.add_argument("--n_mels", type=int, default=128)
+    ap.add_argument("--n_fft", type=int, default=1024)
+    ap.add_argument("--hop_length", type=int, default=512)
 
-    # Log-mel parameters (must match training)
-    ap.add_argument("--n_mels", type=int, default=64, help="Number of mel bins. [default: 64]")
-    ap.add_argument("--n_fft", type=int, default=1024, help="STFT FFT size. [default: 1024]")
-    ap.add_argument("--hop_length", type=int, default=256, help="STFT hop length (samples). [default: 256]")
+    # streaming params
+    ap.add_argument("--win_sec", type=float, default=7.5)
+    ap.add_argument("--hop_sec", type=float, default=0.5)
+    ap.add_argument("--device", type=str, default=None, help="Sounddevice input id or substring")
+    ap.add_argument("--list-devices", action="store_true")
 
-    # Model parameters
-    ap.add_argument("--data_root", type=str, required=True,
-                    help="Path to GTZAN root directory (used to resolve class names if class_map.json not present).")
-    ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt",
-                    help="Path to the trained model weights. [default: artifacts/best_model.pt]")
-    ap.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"],
-                    help="Model architecture to use. [default: smallcnn]")
+    # viz / inference
+    ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--spec_auto_gain", action="store_true", help="Auto color scale per frame")
+    ap.add_argument("--spec_pmin", type=float, default=5.0, help="Lower percentile (auto-gain)")
+    ap.add_argument("--spec_pmax", type=float, default=95.0, help="Upper percentile (auto-gain)")
+    ap.add_argument("--spec_debug", action="store_true")
 
-    # Display / smoothing
-    ap.add_argument("--topk", type=int, default=5, help="How many top classes to display as bars. [default: 5]")
-    ap.add_argument("--ema", type=float, default=0.6,
-                    help="EMA smoothing factor for probabilities (0=no smoothing). [default: 0.6]")
+    # trend line options
+    ap.add_argument("--trend_len", type=int, default=120, help="Number of hops to keep in trend buffer")
+    ap.add_argument("--trend_ema", type=float, default=0.0, help="EMA smoothing (0.0 disables)")
 
-    # Spectrogram scaling (stronger defaults)
-    ap.add_argument("--spec_auto_gain", action="store_true", default=True,
-                    help="Auto-scale spectrogram colors per refresh using percentiles (enabled by default).")
-    ap.add_argument("--spec_pmin", type=float, default=5.0,
-                    help="Lower percentile for auto-scaling (0..50). [default: 5.0]")
-    ap.add_argument("--spec_pmax", type=float, default=95.0,
-                    help="Upper percentile for auto-scaling (50..100). [default: 95.0]")
-    ap.add_argument("--spec_debug", action="store_true",
-                    help="Print per-frame percentile ranges to diagnose flat-color issues.")
     args = ap.parse_args()
 
-    # Handle --list-devices flag
     if args.list_devices:
-        print("Available audio input devices:")
-        print("=" * 80)
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                print(f"  [{i}] {device['name']}")
-                print(f"      Channels: {device['max_input_channels']}, "
-                      f"Sample rate: {device['default_samplerate']} Hz")
-        print("=" * 80)
-        print(f"\nUse --device <index> or --device '<substring>' to select a device.")
+        print(sd.query_devices())
         return
 
-    # Device (CUDA/MPS/CPU for model)
     device = get_device()
+    print(f"Using device: {get_device_name()} ({device})")
 
-    # Load labels
-    idx2name = load_class_map(Path(args.data_root), Path("artifacts"))
-    num_classes = len(idx2name)
+    # classes
+    class_map_path = Path("artifacts") / "class_map.json"
+    if class_map_path.exists():
+        try:
+            class_names = _read_json_classmap(class_map_path)
+        except Exception:
+            class_names = _infer_classes_from_data_root(Path(args.data_root))
+    else:
+        class_names = _infer_classes_from_data_root(Path(args.data_root))
+    num_classes = len(class_names)
+    print(f"Loaded {num_classes} classes: {class_names}")
 
-    # Build & load model
+    # model
+    ckpt = _load_checkpoint(Path(args.checkpoint), device)
+    ckpt_out = _detect_num_classes_from_state_dict(ckpt)
+    if ckpt_out != num_classes:
+        if ckpt_out == len(GTZAN_GENRES):
+            class_names = GTZAN_GENRES
+        else:
+            class_names = [f"class_{i}" for i in range(ckpt_out)]
+        num_classes = ckpt_out
+        print(f"Adjusted class names to checkpoint: {num_classes} classes.")
+
     model = build_model(args.model, num_classes=num_classes).to(device)
-    state = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state)
+    model.load_state_dict(ckpt)
     model.eval()
 
-    # Rolling audio buffer (float32 mono samples)
-    win_samples = int(args.win_sec * args.sr)
-    ring = deque(maxlen=win_samples)
-
-    # Log-mel transform (same as training)
+    # mel on CPU (avoid MPS STFT window mismatch)
     mel_t = get_mel_transform(
         sample_rate=args.sr,
         n_fft=args.n_fft,
@@ -140,143 +173,228 @@ def main():
         n_mels=args.n_mels,
     )
 
-    # ---- Matplotlib UI ----
-    plt.ion()
-    fig = plt.figure(figsize=(12, 6))
-    # Add bottom margin to prevent long x-tick labels from clipping
-    fig.subplots_adjust(bottom=0.22)
+    # audio stream setup
+    blocksize = int(args.sr * args.hop_sec)
+    window_size = int(args.sr * args.win_sec)
+    buf = np.zeros(window_size, dtype=np.float32)
+    q = queue.Queue()
 
-    ax_spec = fig.add_subplot(1, 2, 1)
-    # Initialize with a Normalize that we'll update
-    init_arr = np.zeros((args.n_mels, 10), dtype=np.float32)
-    norm = mcolors.Normalize(vmin=0.0, vmax=1.0, clip=True)
-    spec_im = ax_spec.imshow(init_arr, aspect="auto", origin="lower", norm=norm)
-    ax_spec.set_title("Live Log-Mel Spectrogram")
-    ax_spec.set_xlabel("Time frames")
-    ax_spec.set_ylabel("Mel bins")
-
-    ax_bar = fig.add_subplot(1, 2, 2)
-    bars = ax_bar.bar(range(args.topk), np.zeros(args.topk, dtype=np.float32))
-    ax_bar.set_ylim(0.0, 1.0)
-    ax_bar.set_xticks(range(args.topk))
-    ax_bar.set_xticklabels([""] * args.topk, rotation=45, ha="right")
-    title_txt = fig.suptitle("Listening…")
-
-    # Smoothed probability vector
-    ema_probs = None
-    last_pred_time = 0.0
-
-    # --- Inference helpers ---
-    def predict_from_ring():
-        nonlocal ema_probs, norm
-        if len(ring) < win_samples:
-            return None
-
-        # Build waveform tensor [1, T]
-        wav = np.asarray(ring, dtype=np.float32)
-        # quick sanity: avoid NaNs from audio backend
-        if not np.isfinite(wav).all():
-            return None
-        wav_t = torch.from_numpy(wav).unsqueeze(0)  # [1, T]
-
-        # Compute log-mel: [1, n_mels, time]
-        log_mel = wav_to_logmel(wav_t, sr=args.sr, mel_transform=mel_t)
-
-        # Convert to numpy and sanitize
-        arr = log_mel.squeeze(0).detach().cpu().numpy()
-        if not np.isfinite(arr).all():
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Update spectrogram image and dynamic normalization
-        spec_im.set_data(arr)
-        if args.spec_auto_gain:
-            pmin = max(0.0, min(50.0, float(args.spec_pmin)))
-            pmax = max(50.0, min(100.0, float(args.spec_pmax)))
-            lo = float(np.percentile(arr, pmin))
-            hi = float(np.percentile(arr, pmax))
-            if args.spec_debug:
-                print(f"[spec] p{pmin:.1f}={lo:.4f}, p{pmax:.1f}={hi:.4f}")
-            if hi > lo:
-                # update Normalize object (stronger than set_clim on some backends)
-                norm.vmin = lo
-                norm.vmax = hi
-                spec_im.set_norm(norm)
-
-        # Model inference
-        x = log_mel.unsqueeze(0).to(device)  # [1, 1, H, W]
-        with torch.no_grad():
-            logits = model(x)
-            probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-
-        # EMA smoothing
-        if ema_probs is None:
-            ema_probs = probs
-        else:
-            ema = float(np.clip(args.ema, 0.0, 1.0))
-            ema_probs = ema * ema_probs + (1.0 - ema) * probs
-
-        return ema_probs
-
-    # Audio callback: append mic samples into the ring buffer
-    def audio_callback(indata, frames, time_info, status):
+    def callback(indata, frames, time, status):
         if status:
             print(status)
-        mono = indata.mean(axis=1).astype(np.float32) if indata.shape[1] > 1 else indata[:, 0].astype(np.float32)
-        ring.extend(mono.tolist())
+        q.put(indata.copy())
 
-    # Resolve device by index or substring
-    sd_device = None
-    if args.device is not None:
-        try:
-            sd_device = int(args.device)
-        except ValueError:
-            devices = sd.query_devices()
-            matches = [i for i, d in enumerate(devices)
-                       if args.device.lower() in d["name"].lower()]
-            if not matches:
-                raise RuntimeError(f"No input device matches substring: {args.device!r}")
-            sd_device = matches[0]
-
-    # Start input stream
     stream = sd.InputStream(
-        callback=audio_callback,
-        channels=1,            # 1-channel mono capture
-        samplerate=args.sr,    # must match --sr
-        device=sd_device,
-        dtype="float32",
+        device=args.device,
+        channels=1,
+        samplerate=args.sr,
+        callback=callback,
+        blocksize=blocksize,
     )
 
-    print("Streaming… Press Ctrl+C to stop.")
-    with stream:
-        try:
-            while True:
-                now = time.time()
-                if now - last_pred_time >= args.hop_sec:
-                    last_pred_time = now
-                    probs = predict_from_ring()
-                    if probs is not None:
-                        # Update Top-K bar chart
-                        idxs = np.argsort(-probs)[:args.topk]
-                        top_labels = [idx2name[i] for i in idxs]
-                        top_vals = probs[idxs]
+    # figure layout:
+    #   left: spectrogram (rowspan=2)
+    #   right-top: top-K bars (+ % text)
+    #   right-bottom: rolling top-1 trend
+    plt.ion()
+    fig = plt.figure(figsize=(12, 6))
+    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 2], height_ratios=[3, 1], wspace=0.25, hspace=0.35)
+    ax_spec = fig.add_subplot(gs[:, 0])          # spans both rows
+    ax_bar  = fig.add_subplot(gs[0, 1])          # top-right
+    ax_trend = fig.add_subplot(gs[1, 1])         # bottom-right
 
-                        for b, p in zip(bars, top_vals):
-                            b.set_height(float(p))
-                        ax_bar.set_xticklabels(top_labels, rotation=45, ha="right")
+    # init spec image with tiny noise to avoid vmin==vmax
+    init_img = np.random.randn(args.n_mels, 64) * 1e-6
+    spec_img = ax_spec.imshow(init_img, origin="lower", aspect="auto")
+    ax_spec.set_title("Spectrogram")
+    ax_spec.set_xlabel("Frames")
+    ax_spec.set_ylabel("Mel bins")
 
-                        # Put Top-1 in the figure title
-                        top1_idx = int(idxs[0])
-                        title_txt.set_text(f"Top-1: {idx2name[top1_idx]} (p={probs[top1_idx]:.2f})")
+    # init bars + value labels
+    topk = max(1, min(args.topk, num_classes))
+    bars = ax_bar.barh(range(topk), np.zeros(topk), align="center")
+    ax_bar.set_xlim(0.0, 1.0)
+    ax_bar.set_yticks(range(topk))
+    ax_bar.set_yticklabels([""] * topk)
+    ax_bar.invert_yaxis()  # top-1 at top
+    ax_bar.set_xlabel("Probability")
+    ax_bar.set_title(f"Top-{topk} predictions")
+    bar_texts = [ax_bar.text(0.0, i, "", va="center", ha="left", fontsize=9) for i in range(topk)]
 
-                    # Refresh UI
-                    fig.canvas.draw_idle()
+    # trend buffers and line
+    trend_len = max(2, args.trend_len)
+    xs = np.arange(trend_len) * args.hop_sec  # seconds
+    trend_buf = deque([np.nan] * trend_len, maxlen=trend_len)
+    ema_val = None if args.trend_ema <= 0.0 else 0.0
+    (trend_line,) = ax_trend.plot(xs, [np.nan] * trend_len, lw=2)
+    ax_trend.set_ylim(0.0, 1.0)
+    ax_trend.set_xlim(xs[0], xs[-1] if len(xs) > 1 else trend_len)
+    ax_trend.set_xlabel("Time (s)")
+    ax_trend.set_ylabel("Top-1 p")
+    ax_trend.grid(True, alpha=0.25)
+    if ema_val is not None:
+        (ema_line,) = ax_trend.plot(xs, [np.nan] * trend_len, lw=1, alpha=0.7)
+    else:
+        ema_line = None
+
+    # for stable color scaling when auto_gain is off
+    last_clim = None
+
+    # ------------- keyboard controls -------------
+    state = {"paused": False, "running": True}
+
+    def on_key(event):
+        if event.key == " ":
+            state["paused"] = not state["paused"]
+            if state["paused"]:
+                fig.suptitle("⏸ PAUSED", fontsize=12, color="gray")
+            else:
+                fig.suptitle("", fontsize=12, color="black")
+            fig.canvas.draw_idle()
+        elif event.key in ("q", "Q"):
+            state["running"] = False
+
+    cid = fig.canvas.mpl_connect("key_press_event", on_key)
+    # ---------------------------------------------
+
+    print("🎙️  Streaming... (SPACE=pause/resume, q=quit)")
+    try:
+        with stream:
+            while state["running"]:
+                try:
+                    data = q.get(timeout=0.1).squeeze()
+                except queue.Empty:
                     plt.pause(0.001)
+                    continue
 
-                time.sleep(0.01)
-        except KeyboardInterrupt:
+                if data.ndim > 1:
+                    data = data[:, 0]
+                L = len(data)
+                if L == 0:
+                    continue
+
+                # Even while paused, consume the queue to avoid growth,
+                # but skip processing/visual update.
+                if state["paused"]:
+                    plt.pause(0.001)
+                    continue
+
+                # roll buffer and append
+                if L >= window_size:
+                    buf[:] = data[-window_size:]
+                else:
+                    buf = np.roll(buf, -L)
+                    buf[-L:] = data
+
+                # CPU mel
+                wav = torch.from_numpy(buf).unsqueeze(0)  # [1, T], CPU
+                logmel = wav_to_logmel(wav, sr=args.sr, mel_transform=mel_t)  # [1, n_mels, time], CPU
+                logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-6)
+                mel_img = logmel.squeeze(0).cpu().numpy()  # [n_mels, time]
+
+                # inference on device
+                with torch.no_grad():
+                    feats = logmel.unsqueeze(0).to(device)  # [B=1, 1, n_mels, time]
+                    logits = model(feats)
+                    probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+                # top-k
+                order = np.argsort(probs)[::-1][:topk]
+                top_probs = probs[order]
+                top_names = [class_names[i] if i < len(class_names) else f"class_{i}" for i in order]
+
+                # dynamic x-limit based on top-1
+                xmax = max(1.0, float(top_probs[0]) * 1.1)
+                ax_bar.set_xlim(0.0, xmax)
+
+                # update bars and their percentage texts
+                for i, (bar, p) in enumerate(zip(bars, top_probs)):
+                    width = float(p)
+                    bar.set_width(width)
+
+                    label = f"{100.0 * width:.1f}%"
+                    thresh_inside = 0.18 * xmax
+                    if width >= thresh_inside:
+                        x_text = max(0.0, width - 0.02 * xmax)
+                        ha = "right"
+                        color = "white"
+                    else:
+                        x_text = min(width + 0.02 * xmax, xmax * 0.98)
+                        ha = "left"
+                        color = "black"
+
+                    bar_texts[i].set_text(label)
+                    bar_texts[i].set_x(x_text)
+                    bar_texts[i].set_y(i)
+                    bar_texts[i].set_ha(ha)
+                    bar_texts[i].set_color(color)
+
+                ax_bar.set_yticklabels(top_names)
+
+                # update spec image with sane color scaling
+                vmin, vmax = _compute_spec_limits(mel_img, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim)
+                if args.spec_auto_gain:
+                    spec_img.set_clim(vmin=vmin, vmax=vmax)
+                    last_clim = (vmin, vmax)
+                spec_img.set_data(mel_img)
+
+                # title w/ top-1
+                pred_label = top_names[0]
+                pred_prob = float(top_probs[0])
+                fig.suptitle(f"{pred_label} ({pred_prob*100:4.1f}%)", fontsize=12)
+
+                # update trend buffers/lines
+                trend_buf.append(pred_prob)
+                y = np.array(trend_buf, dtype=float)
+                trend_line.set_ydata(y)
+
+                if ema_line is not None:
+                    alpha = float(args.trend_ema)
+                    # Initialize EMA at first valid prob
+                    if np.isnan(y[-1]):
+                        pass
+                    else:
+                        non_nan = y[~np.isnan(y)]
+                        if len(non_nan) and (np.isnan(ema_val) or ema_val is None):
+                            ema = non_nan[-1]
+                        else:
+                            ema = alpha * y[-1] + (1.0 - alpha) * (ema_val if ema_val is not None else y[-1])
+                        ema_val_local = ema
+                        ema_series = []
+                        prev = ema_val if ema_val is not None else y[-1]
+                        for v in y:
+                            if np.isnan(v):
+                                ema_series.append(np.nan)
+                            else:
+                                prev = alpha * v + (1.0 - alpha) * prev
+                                ema_series.append(prev)
+                        ema_line.set_ydata(np.array(ema_series, dtype=float))
+                        ema_val = ema_val_local
+
+                if args.spec_debug:
+                    print(f"spec range: vmin={vmin:.3f} vmax={vmax:.3f}; "
+                          f"mel mean={mel_img.mean():.3f} std={mel_img.std():.3f}; "
+                          f"top1={pred_label}:{pred_prob:.3f}")
+
+                plt.pause(0.001)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            fig.canvas.mpl_disconnect(cid)
+        except Exception:
             pass
+        plt.ioff()
+        plt.close(fig)
+        # Ensure stream closes
+        try:
+            stream.abort()
+            stream.close()
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
     main()
-    

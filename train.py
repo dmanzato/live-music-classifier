@@ -1,15 +1,17 @@
-"""Training script for audio classification models."""
+"""Training script for audio classification models (GTZAN genres)."""
 import argparse
 import logging
 import os
 import sys
 from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, confusion_matrix
-import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
 import matplotlib.pyplot as plt
 
 from datasets.gtzan import GTZAN
@@ -22,131 +24,172 @@ from utils.class_map import save_class_map
 logger = get_logger("train")
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
+def _unpack_batch(batch):
+    """Allow datasets that return (x,y) or (x,y,meta)."""
+    if isinstance(batch, (tuple, list)):
+        if len(batch) == 2:
+            x, y = batch
+            return x, y, None
+        if len(batch) == 3:
+            x, y, meta = batch
+            return x, y, meta
+    return batch, None, None
+
+
+def _normalize_per_sample(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize each sample's spectrogram: (x - mean) / (std + eps)
+    Expects x = [B,1,H,W] (log-mel).
+    """
+    mean = x.mean(dim=(2, 3), keepdim=True)
+    std = x.std(dim=(2, 3), keepdim=True)
+    return (x - mean) / (std + 1e-6)
+
+
+def mixup_batch(x, y, alpha=0.0):
+    """Standard mixup on features (spectrograms)."""
+    if alpha <= 0.0:
+        return x, y, None
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    x_m = lam * x + (1.0 - lam) * x[idx]
+    return x_m, y, (idx, lam)
+
+
+def compute_class_weights(subset, num_classes: int) -> torch.DoubleTensor:
+    """
+    Compute per-sample weights for a Subset for use with WeightedRandomSampler.
+    Works whether subset is a torch.utils.data.Subset or a Dataset.
+    """
+    if hasattr(subset, "indices") and hasattr(subset, "dataset"):
+        # Subset case
+        indices = subset.indices
+        base_ds = subset.dataset
+        labels = []
+        for i in indices:
+            item = base_ds[i]
+            # item may be (x,y) or (x,y,meta)
+            _, y, _ = _unpack_batch(item)
+            labels.append(int(y))
+    else:
+        # Dataset case
+        labels = []
+        for i in range(len(subset)):
+            _, y, _ = _unpack_batch(subset[i])
+            labels.append(int(y))
+
+    labels = np.asarray(labels, dtype=np.int64)
+    counts = np.bincount(labels, minlength=num_classes)
+    inv = 1.0 / np.maximum(counts, 1)
+    sample_weights = inv[labels]
+    return torch.DoubleTensor(sample_weights)
+
+
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int):
     """
-    Evaluate model on a dataset.
-    
-    Args:
-        model: Model to evaluate.
-        loader: DataLoader for the evaluation dataset.
-        device: Device to run evaluation on.
-        num_classes: Number of classes.
-    
-    Returns:
-        Tuple of (macro F1 score, confusion matrix).
+    Evaluate model on a dataset. Returns (macro F1, confusion matrix).
     """
     model.eval()
     ys, preds = [], []
-    
-    try:
-        with torch.no_grad():
-            for x, y in loader:
-                x = x.to(device)
-                y = y.to(device)
-                logits = model(x)
-                pred = logits.argmax(dim=1)
-                ys.append(y.cpu().numpy())
-                preds.append(pred.cpu().numpy())
-        
-        ys = np.concatenate(ys)
-        preds = np.concatenate(preds)
-        cm = confusion_matrix(ys, preds, labels=list(range(num_classes)))
-        f1 = f1_score(ys, preds, average="macro")
-        return f1, cm
-    except Exception as e:
-        logger.error(f"Error during evaluation: {e}", exc_info=True)
-        raise
+    with torch.no_grad():
+        for batch in loader:
+            x, y, _ = _unpack_batch(batch)
+            x = x.to(device)
+            y = y.to(device)
+            x = _normalize_per_sample(x)
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            ys.append(y.cpu().numpy())
+            preds.append(pred.cpu().numpy())
+
+    ys = np.concatenate(ys)
+    preds = np.concatenate(preds)
+    cm = confusion_matrix(ys, preds, labels=list(range(num_classes)))
+    f1 = f1_score(ys, preds, average="macro")
+    return f1, cm
 
 
 def plot_confusion_matrix(cm: np.ndarray, out_path: str) -> None:
-    """
-    Plot and save confusion matrix.
-    
-    Args:
-        cm: Confusion matrix array.
-        out_path: Path to save the plot.
-    """
-    try:
-        fig = plt.figure()
-        plt.imshow(cm, interpolation='nearest')
-        plt.title('Confusion matrix')
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.colorbar()
-        plt.tight_layout()
-        fig.savefig(out_path)
-        plt.close(fig)
-        logger.debug(f"Saved confusion matrix to {out_path}")
-    except Exception as e:
-        logger.error(f"Error saving confusion matrix to {out_path}: {e}", exc_info=True)
-        raise
+    """Plot and save confusion matrix."""
+    fig = plt.figure()
+    plt.imshow(cm, interpolation="nearest")
+    plt.title("Confusion matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.colorbar()
+    plt.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    logger.debug(f"Saved confusion matrix to {out_path}")
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    """
-    Main training function.
-    
-    Parses arguments, sets up datasets, trains model, and saves checkpoints.
-    """
-    # Setup logging
     setup_logging(level=logging.INFO)
-    
-    ap = argparse.ArgumentParser(description="Train audio classification model on GTZAN")
-    ap.add_argument("--data_root", type=str, required=True, help="Path to GTZAN root directory")
-    ap.add_argument("--train_ratio", type=float, default=0.8, help="Proportion of data for training (default: 0.8)")
-    ap.add_argument("--val_ratio", type=float, default=0.1, help="Proportion of data for validation (default: 0.1)")
-    ap.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    ap.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    ap.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+
+    ap = argparse.ArgumentParser(description="Train audio classification model (GTZAN genres)")
+    ap.add_argument("--data_root", type=str, required=True, help="Path with GTZAN genre subfolders")
+    ap.add_argument("--train_ratio", type=float, default=0.8, help="Train split ratio")
+    ap.add_argument("--val_ratio", type=float, default=0.1, help="Val split ratio")
+    ap.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    ap.add_argument("--epochs", type=int, default=25, help="Epochs")
+    ap.add_argument("--lr", type=float, default=3e-4, help="Base learning rate")
+    ap.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     ap.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"], help="Model architecture")
-    ap.add_argument("--use_specaug", action="store_true", help="Use SpecAugment data augmentation")
-    ap.add_argument("--num_workers", type=int, default=0, help="Number of data loading workers")
-    ap.add_argument("--n_mels", type=int, default=64, help="Number of mel bins")
+    ap.add_argument("--use_specaug", action="store_true", help="Enable SpecAugment")
+    ap.add_argument("--mixup_alpha", type=float, default=0.2, help="Mixup alpha (0=off)")
+    ap.add_argument("--balanced_sampler", action="store_true", help="Balanced sampling on train split")
+    ap.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
+
+    # Music-friendly defaults
+    ap.add_argument("--n_mels", type=int, default=128, help="Mel bins")
     ap.add_argument("--n_fft", type=int, default=1024, help="FFT size")
-    ap.add_argument("--hop_length", type=int, default=256, help="STFT hop length")
-    ap.add_argument("--duration", type=float, default=4.0, help="Audio clip duration in seconds")
-    ap.add_argument("--sr", type=int, default=16000, help="Sample rate")
+    ap.add_argument("--hop_length", type=int, default=512, help="STFT hop length")
+    ap.add_argument("--duration", type=float, default=5.0, help="Clip duration (s)")
+    ap.add_argument("--sr", type=int, default=22050, help="Sample rate")
+    ap.add_argument("--warmup_epochs", type=int, default=2, help="Warmup epochs (linear) before cosine schedule")
+
     ap.add_argument("--log_file", type=str, default=None, help="Optional log file path")
     args = ap.parse_args()
-    
-    # Setup logging with optional file
+
     if args.log_file:
         setup_logging(level=logging.INFO, log_file=args.log_file)
-    
+
     logger.info("=" * 60)
     logger.info("Starting training")
     logger.info("=" * 60)
-    
-    # Validate data root
+
     data_root = Path(args.data_root)
     if not data_root.exists():
         logger.error(f"Data root does not exist: {data_root}")
         sys.exit(1)
-    
-    # Determine device (CUDA > MPS > CPU)
+
     device = get_device()
     logger.info(f"Using device: {get_device_name()} ({device})")
 
-    # Validate split ratios
     if args.train_ratio + args.val_ratio >= 1.0:
         logger.error(f"train_ratio + val_ratio must be < 1.0 (got {args.train_ratio + args.val_ratio})")
         sys.exit(1)
-    
-    logger.info(f"Train ratio: {args.train_ratio}, Val ratio: {args.val_ratio}, Test ratio: {1.0 - args.train_ratio - args.val_ratio}")
-    
-    # Setup augmentation
+
+    logger.info(
+        f"Train ratio: {args.train_ratio}, Val ratio: {args.val_ratio}, "
+        f"Test ratio (implied): {1.0 - args.train_ratio - args.val_ratio:.2f}"
+    )
+
     augment = SpecAugment() if args.use_specaug else None
     if augment:
         logger.info("Using SpecAugment data augmentation")
-    
-    # Load datasets
+
+    # Load full dataset, then split
     try:
-        logger.info("Loading training dataset...")
-        train_ds = GTZAN(
-            root=str(data_root),
-            split='train',
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
+        logger.info("Loading full GTZAN dataset...")
+        full_ds = GTZAN(
+            data_root=str(data_root),
             target_sr=args.sr,
             duration=args.duration,
             n_mels=args.n_mels,
@@ -154,120 +197,161 @@ def main():
             hop_length=args.hop_length,
             augment=augment,
         )
-        logger.info("Loading validation dataset...")
-        val_ds = GTZAN(
-            root=str(data_root),
-            split='val',
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            target_sr=args.sr,
-            duration=args.duration,
-            n_mels=args.n_mels,
-            n_fft=args.n_fft,
-            hop_length=args.hop_length,
-            augment=None,
-        )
+        N = len(full_ds)
+        n_train = int(N * args.train_ratio)
+        n_val = int(N * args.val_ratio)
+        n_test = N - n_train - n_val
+        logger.info(f"Splitting dataset: {n_train} train / {n_val} val / {n_test} test")
+
+        from torch.utils.data import random_split
+        splits = [n_train, n_val, n_test] if n_test > 0 else [n_train, N - n_train]
+        parts = random_split(full_ds, splits, generator=torch.Generator().manual_seed(42))
+        train_ds, val_ds = parts[0], parts[1]
     except Exception as e:
         logger.error(f"Error loading datasets: {e}", exc_info=True)
         sys.exit(1)
-    
-    num_classes = len(train_ds.GENRES)
+
+    # Class names & count
+    try:
+        base = train_ds.dataset if hasattr(train_ds, "dataset") else full_ds
+        idx2name = getattr(base, "idx2name", ["blues","classical","country","disco","hiphop","jazz","metal","pop","reggae","rock"])
+        num_classes = len(idx2name)
+    except Exception as e:
+        logger.error(f"Could not derive class names: {e}", exc_info=True)
+        sys.exit(1)
+
     logger.info(f"Classes: {num_classes} | Train items: {len(train_ds)} | Val items: {len(val_ds)}")
 
-    # Create data loaders
+    # DataLoaders (optionally balanced sampler for train)
     try:
+        pin_mem = (device.type == "cuda")
+        persistent = args.num_workers > 0
+
+        sampler = None
+        shuffle = True
+        if args.balanced_sampler:
+            weights = compute_class_weights(train_ds, num_classes)
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            shuffle = False
+            logger.info("Using WeightedRandomSampler for class-balanced batches")
+
         train_dl = DataLoader(
             train_ds,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=pin_mem,
+            persistent_workers=persistent,
         )
         val_dl = DataLoader(
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=pin_mem,
+            persistent_workers=persistent,
         )
     except Exception as e:
         logger.error(f"Error creating data loaders: {e}", exc_info=True)
         sys.exit(1)
-    
-    # Create artifacts directory
+
+    # Artifacts
     artifacts_dir = Path("artifacts")
     artifacts_dir.mkdir(exist_ok=True)
     logger.info(f"Artifacts directory: {artifacts_dir.absolute()}")
-    
-    # Build model
+
+    # Model
     try:
         model = build_model(args.model, num_classes).to(device)
-        logger.info(f"Model created: {args.model} with {sum(p.numel() for p in model.parameters())} parameters")
+        n_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Model created: {args.model} with {n_params} parameters")
     except Exception as e:
         logger.error(f"Error building model: {e}", exc_info=True)
         sys.exit(1)
-    
-    # Save class map for inference scripts
+
+    # Save class map
     try:
-        idx2name = [train_ds.idx2name[i] for i in range(num_classes)]
-        save_class_map(artifacts_dir, idx2name)
+        save_class_map(artifacts_dir, list(idx2name))
+        logger.info("Saved class map to artifacts/class_map.json")
     except Exception as e:
         logger.warning(f"Could not save class map: {e}")
-    
-    opt = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Optimizer + schedule
+    opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    warmup_epochs = max(0, int(args.warmup_epochs))
+    T_max = max(1, args.epochs - warmup_epochs)
+    scheduler = CosineAnnealingLR(opt, T_max=T_max)
+
     loss_fn = nn.CrossEntropyLoss()
-    logger.info(f"Optimizer: Adam, Learning rate: {args.lr}")
-    
     best_f1 = -1.0
     logger.info(f"Starting training for {args.epochs} epochs...")
-    
+
     for epoch in range(1, args.epochs + 1):
         logger.info(f"Epoch {epoch}/{args.epochs}")
-        # Training phase
+
+        # Warmup: linear ramp lr during first warmup_epochs
+        if epoch <= warmup_epochs:
+            warm_lr = (epoch / float(warmup_epochs)) * args.lr
+            for pg in opt.param_groups:
+                pg["lr"] = warm_lr
+            logger.info(f"Warmup LR set to {warm_lr:.6f}")
+
+        # ----------------- Train -----------------
         model.train()
         total_loss, total_correct, total = 0.0, 0, 0
-        
-        try:
-            for batch_idx, (x, y) in enumerate(train_dl):
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
-                loss = loss_fn(logits, y)
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                
-                total_loss += loss.item() * x.size(0)
-                total_correct += (logits.argmax(dim=1) == y).sum().item()
-                total += x.size(0)
-                
-                if (batch_idx + 1) % 10 == 0:
-                    logger.debug(f"  Batch {batch_idx + 1}/{len(train_dl)}, Loss: {loss.item():.4f}")
-        except Exception as e:
-            logger.error(f"Error during training epoch {epoch}: {e}", exc_info=True)
-            continue
-        
+
+        for batch_idx, batch in enumerate(train_dl):
+            x, y, _ = _unpack_batch(batch)
+            x, y = x.to(device), y.to(device)
+            x = _normalize_per_sample(x)
+
+            # mixup
+            x_in, y_in, mix = mixup_batch(x, y, alpha=args.mixup_alpha)
+
+            logits = model(x_in)
+            if mix is None:
+                loss = loss_fn(logits, y_in)
+                preds = logits.argmax(dim=1)
+                total_correct += (preds == y_in).sum().item()
+            else:
+                index, lam = mix
+                loss = lam * loss_fn(logits, y_in) + (1 - lam) * loss_fn(logits, y_in[index])
+                preds = logits.argmax(dim=1)
+                total_correct += (preds == y_in).sum().item()
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item() * x.size(0)
+            total += x.size(0)
+
+            if (batch_idx + 1) % 10 == 0:
+                logger.debug(f"  Batch {batch_idx + 1}/{len(train_dl)}, Loss: {loss.item():.4f}")
+
         train_loss = total_loss / total if total > 0 else 0.0
         train_acc = total_correct / total if total > 0 else 0.0
-        
-        # Validation phase
-        try:
-            f1, cm = evaluate(model, val_dl, device, num_classes)
-            logger.info(
-                f"Epoch {epoch}: train_loss={train_loss:.4f} "
-                f"train_acc={train_acc:.3f} val_f1_macro={f1:.3f}"
-            )
-        except Exception as e:
-            logger.error(f"Error during validation epoch {epoch}: {e}", exc_info=True)
-            continue
-        
+
+        # Step cosine schedule after warmup
+        if epoch > warmup_epochs:
+            scheduler.step()
+
+        # ----------------- Validate -----------------
+        f1, cm = evaluate(model, val_dl, device, num_classes)
+        logger.info(
+            f"Epoch {epoch}: train_loss={train_loss:.4f} "
+            f"train_acc={train_acc:.3f} val_f1_macro={f1:.3f}"
+        )
+
         # Save confusion matrix
         try:
             cm_path = artifacts_dir / f"confusion_matrix_epoch{epoch}.png"
             plot_confusion_matrix(cm, str(cm_path))
-            logger.debug(f"Saved confusion matrix to {cm_path}")
         except Exception as e:
             logger.warning(f"Could not save confusion matrix: {e}")
-        
+
         # Save best model
         if f1 > best_f1:
             best_f1 = f1
@@ -276,11 +360,12 @@ def main():
                 torch.save(model.state_dict(), checkpoint_path)
                 logger.info(f"Saved best model (F1={f1:.3f}) to {checkpoint_path}")
             except Exception as e:
-                logger.error(f"Error saving model checkpoint: {e}", exc_info=True)
-    
+                logger.error(f"Error saving model checkpoint: {e}")
+
     logger.info("=" * 60)
     logger.info(f"Training completed. Best F1 score: {best_f1:.3f}")
     logger.info("=" * 60)
+
 
 if __name__ == "__main__":
     main()

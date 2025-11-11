@@ -1,357 +1,504 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-Visualize GTZAN dataset files (no microphone), with audio playback and keyboard controls.
-Now uses SoundFile (libsndfile) + SciPy for audio loading/resampling to avoid torchcodec.
+Visualize GTZAN spectrograms + predictions with rolling updates and a top-1 trend line.
 
-Features
-- Loads from dataset split (same preprocessing as training: resample + pad/trim)
-- Displays live-updating log-mel spectrogram
-- Shows ground-truth label + model Top-K predictions
-- Plays the exact audio window that produced the spectrogram
-- Keyboard controls:
-    Space  : pause/resume auto-advance
-    Right  : next sample
-    Left   : previous sample
-    P      : toggle audio playback on/off
-    G      : toggle spectrogram auto-gain per frame
-    Q/Esc  : quit
+Keys:
+  Left/Right : previous/next item
+  Space      : pause/resume auto-advance
+  p          : play/stop audio of current item
+  q          : quit
 
-Usage:
-  export PYTHONPATH=.
-  python scripts/vis_dataset.py \
-    --data_root ../data/GTZAN \
+Example:
+  PYTHONPATH=. python scripts/vis_dataset.py \
+    --data_root /Users/you/data/GTZAN/genres_original \
     --split test \
     --checkpoint artifacts/best_model.pt \
-    --model smallcnn \
-    --spec_auto_gain \
-    --sleep 0.6 \
-    --play_audio
+    --model resnet18 \
+    --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --duration 30.0 --hold_sec 30.0 \
+    --ana_win_sec 3.0 --ana_hop_sec 0.5 \
+    --play_audio --out_latency high
 """
 
 import argparse
-import os
-import sys
+import json
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.nn as nn
-import torchaudio  # still used by your dataset; playback loader doesn't rely on it
-
-# Ensure local imports resolve even if a PyPI package named "transforms" exists
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from datasets.gtzan import GTZAN
-from utils.device import get_device
-from utils.models import build_model
-
-# Playback + file I/O backends (no torchcodec needed)
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None  # playback optional
-
+import sounddevice as sd
 import soundfile as sf
+import torch
+from matplotlib import gridspec
 from scipy.signal import resample_poly
 
+from datasets.gtzan import GTZAN
+from transforms.audio import get_mel_transform, wav_to_logmel
+from utils.device import get_device, get_device_name
+from utils.models import build_model
 
-def load_id_to_name(data_root: Path):
-    """Loads GTZAN genre names from dataset structure"""
-    from datasets.gtzan import GTZAN_GENRES
-    # GTZAN uses genre folder names as class names
-    id_to_name = {i: genre for i, genre in enumerate(GTZAN_GENRES)}
-    return id_to_name
+GTZAN_GENRES = [  # Ordered class names used by GTZAN (10-way classification)
+    "blues","classical","country","disco","hiphop",
+    "jazz","metal","pop","reggae","rock"
+]
 
+# ---------- util helpers ----------
+def _read_json_classmap(p: Path):
+    with open(p, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "idx2name" in data:
+        return data["idx2name"]
+    if isinstance(data, list):
+        return data
+    raise ValueError("Invalid class_map.json format")
 
-def idx_to_name(dataset: GTZAN, y_idx: int, id_to_name: dict):
-    """
-    Convert dataset's numeric label -> readable class name.
-
-    Priority:
-      1. dataset.class_ids[y_idx] -> classID -> id_to_name
-      2. dataset.idx2name[y_idx] (if provided)
-      3. fallback: f"class_{y_idx}"
-    """
-    # Try class_ids -> classID -> lookup
-    if hasattr(dataset, "class_ids") and len(dataset.class_ids) > y_idx:
-        class_id = int(dataset.class_ids[y_idx])  # e.g. 0..9
-        if class_id in id_to_name:
-            return id_to_name[class_id]
-
-    # Try idx2name as list
-    if hasattr(dataset, "idx2name") and isinstance(dataset.idx2name, list):
-        if y_idx < len(dataset.idx2name):
-            return dataset.idx2name[y_idx]
-
-    # fallback
-    return f"class_{y_idx}"
-
-
-def load_wave_fixed(path: Path, target_sr: int, duration: float) -> torch.Tensor:
-    """
-    Load waveform from disk with SoundFile -> mono -> resample with SciPy -> pad/trim to fixed duration.
-    Returns a tensor [1, T] at target_sr and exactly duration seconds long.
-    """
-    # Read file (float32)
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)  # shape [T, C]
-    if data.shape[1] > 1:
-        data = data.mean(axis=1, keepdims=True)  # [T, 1]
+def _compute_spec_limits(mel_img: np.ndarray, auto_gain: bool, pmin: float, pmax: float, prev=None):
+    if auto_gain:
+        lo = np.percentile(mel_img, pmin)
+        hi = np.percentile(mel_img, pmax)
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+            lo, hi = (mel_img.min(), mel_img.max())
+            if lo == hi: hi = lo + 1e-6
+        return lo, hi
     else:
-        # already mono column
-        pass
-    y = data[:, 0]  # [T]
+        if prev is None:
+            lo, hi = (mel_img.min(), mel_img.max())
+            if lo == hi: hi = lo + 1e-6
+            return lo, hi
+        return prev
 
-    # Resample if needed using polyphase (integer up/down)
+def _load_wav_centered(path: Path, target_sr: int, duration: float) -> np.ndarray:
+    x, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    x = x.mean(axis=1) if x.shape[1] > 1 else x[:, 0]
     if sr != target_sr:
-        # Up = target_sr, Down = sr (both ints)
-        y = resample_poly(y, target_sr, sr).astype(np.float32)
-        sr = target_sr
-
-    # Pad/trim to exactly duration
-    num_samples = int(duration * sr)
-    if len(y) < num_samples:
-        y = np.pad(y, (0, num_samples - len(y)))
+        x = resample_poly(x, target_sr, sr).astype(np.float32)
+    N = int(duration * target_sr)
+    if len(x) < N:
+        pad = N - len(x)
+        left, right = pad // 2, pad - pad // 2
+        x = np.pad(x, (left, right))
     else:
-        y = y[:num_samples]
+        start = max(0, (len(x) - N) // 2)
+        x = x[start:start + N]
+    return x
 
-    y = np.ascontiguousarray(y, dtype=np.float32)
-    return torch.from_numpy(y)[None, :]  # [1, T]
-
-
-def play_audio_blocking(wav_1xT: torch.Tensor, sr: int, out_device=None):
-    """
-    Play mono waveform [1, T] via sounddevice (if available). Blocks until finished.
-    """
-    if sd is None:
-        print("[warn] sounddevice not installed; skipping playback. pip install sounddevice")
-        return
-    arr = wav_1xT.squeeze(0).detach().cpu().numpy()
-    sd.stop(ignore_errors=True)
-    sd.play(arr, sr, device=out_device)
-    sd.wait()
-
-
-def compute_topk(logits: torch.Tensor, k: int = 5):
-    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-    idxs = np.argsort(-probs)[:k]
-    return probs, idxs
-
-
-# -----------------------------
-# Viewer with keyboard controls
-# -----------------------------
-class Viewer:
-    def __init__(self, args):
-        self.args = args
-        self.device = get_device()
-
-        # Dataset
-        self.data_root = Path(args.data_root)
-        self.ds = GTZAN(
-            root=str(self.data_root),
-            split=args.split,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            target_sr=args.sr,
-            duration=args.duration,
-            augment=None,  # no augmentation for visualization
-        )
-        self.n = len(self.ds)
-
-        # Labels mapping
-        self.id_to_name = load_id_to_name(self.data_root)
-        self.num_classes = len(getattr(self.ds, "class_ids", []) or getattr(self.ds, "idx2name", []) or [])
-        if self.num_classes == 0:
-            self.num_classes = 10
-
-        # Model
-        self.model = build_model(args.model, self.num_classes).to(self.device)
-        state_dict = torch.load(args.checkpoint, map_location=self.device)
-        self.model.load_state_dict(state_dict)
-        self.model.eval()
-
-        # Audio output device
-        self.out_dev = None
-        if sd is not None and args.out_device is not None:
-            try:
-                self.out_dev = int(args.out_device)
-            except ValueError:
-                devices = sd.query_devices()
-                matches = [i for i, d in enumerate(devices) if args.out_device.lower() in d["name"].lower()]
-                if matches:
-                    self.out_dev = matches[0]
-
-        # Matplotlib UI
-        plt.ion()
-        self.fig = plt.figure(figsize=(12, 7))
-        # Add bottom margin to avoid long x-tick labels clipping
-        self.fig.subplots_adjust(bottom=0.24)
-
-        self.ax_spec = self.fig.add_subplot(1, 2, 1)
-        self.spec_im = self.ax_spec.imshow(np.zeros((64, 10)), origin="lower", aspect="auto")
-        self.ax_spec.set_title("Log-Mel Spectrogram")
-        self.ax_spec.set_xlabel("Time Frames")
-        self.ax_spec.set_ylabel("Mel Bins")
-
-        self.ax_bar = self.fig.add_subplot(1, 2, 2)
-        self.bars = self.ax_bar.bar(range(self.args.topk), np.zeros(self.args.topk))
-        self.ax_bar.set_ylim(0, 1)
-        self.ax_bar.set_xticks(range(self.args.topk))
-        self.ax_bar.set_xticklabels([""] * self.args.topk, rotation=45, ha="right")
-        self.title_txt = self.fig.suptitle("Ready")
-
-        # State
-        self.idx = 0
-        self.running = True
-        self.auto = True           # auto-advance
-        self.play_audio = bool(args.play_audio)
-        self.spec_auto_gain = bool(args.spec_auto_gain)
-
-        # Events
-        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
-
-    # --- Key handling ---
-    def on_key(self, event):
-        key = (event.key or "").lower()
-        if key in (" ",):             # Space = pause/resume
-            self.auto = not self.auto
-            self._update_status()
-        elif key in ("right",):       # Next
-            self.auto = False
-            self.idx = min(self.n - 1, self.idx + 1)
-            self.render(self.idx)
-        elif key in ("left",):        # Prev
-            self.auto = False
-            self.idx = max(0, self.idx - 1)
-            self.render(self.idx)
-        elif key in ("p",):           # Toggle playback
-            self.play_audio = not self.play_audio
-            self._update_status()
-        elif key in ("g",):           # Toggle auto gain for spectrogram
-            self.spec_auto_gain = not self.spec_auto_gain
-            self._update_status()
-        elif key in ("q", "escape"):  # Quit
-            self.running = False
-        # ignore other keys
-
-    def _update_status(self):
-        status = []
-        status.append("PAUSED" if not self.auto else "AUTO")
-        status.append("PLAY" if self.play_audio else "MUTE")
-        status.append("GAIN" if self.spec_auto_gain else "FIXED")
-        self.title_txt.set_text(" | ".join(status))
-        self.title_txt.set_color("black")
-        self.fig.canvas.draw_idle()
-
-    # --- Core render ---
-    def render(self, i: int):
-        # get dataset item
-        item = self.ds[i]
-        if not (isinstance(item, tuple) and len(item) >= 2):
-            raise RuntimeError("Unexpected dataset item format.")
-        x, y = item[0], item[1]  # x:[1, n_mels, time], y:int
-
-        # model prediction
-        xb = x.unsqueeze(0).to(self.device)  # [1,1,H,W]
-        with torch.no_grad():
-            logits = self.model(xb)
-        probs, top_idx = compute_topk(logits, k=self.args.topk)
-
-        # labels
-        y_idx = int(y)
-        gt_label = idx_to_name(self.ds, y_idx, self.id_to_name)
-        top_labels = [idx_to_name(self.ds, int(j), self.id_to_name) for j in top_idx]
-
-        # spectrogram
-        arr = x[0].detach().cpu().numpy()
-        self.spec_im.set_data(arr)
-        if self.spec_auto_gain:
-            lo, hi = np.percentile(arr, [5, 95])
-            if hi > lo:
-                self.spec_im.set_clim(lo, hi)
-
-        # bars
-        for bar, j in zip(self.bars, top_idx):
-            bar.set_height(float(probs[j]))
-        self.ax_bar.set_xticklabels(top_labels, rotation=45, ha="right")
-
-        # title (green if correct, red otherwise)
-        pred_is_correct = (top_labels[0] == gt_label)
-        self.title_txt.set_text(f"GT: {gt_label} | Pred: {top_labels[0]} ({probs[top_idx[0]]:.2f})")
-        self.title_txt.set_color("green" if pred_is_correct else "red")
-
-        self.fig.canvas.draw_idle()
-        plt.pause(0.001)
-
-        # playback (SoundFile + SciPy; no torchcodec)
-        if self.play_audio and sd is not None and hasattr(self.ds, "df"):
-            try:
-                path = Path(self.ds.df.iloc[i]["filepath"])
-                wav = load_wave_fixed(path, target_sr=self.args.sr, duration=self.args.duration)
-                play_audio_blocking(wav, sr=self.args.sr, out_device=self.out_dev)
-            except Exception as e:
-                print(f"[warn] playback failed for index {i}: {e}")
-
-    # --- Main loop ---
-    def loop(self):
-        self._update_status()
-        last_time = time.time()
-        while self.running:
-            if self.auto:
-                now = time.time()
-                if now - last_time >= self.args.sleep:
-                    last_time = now
-                    self.render(self.idx)
-                    if self.idx < self.n - 1:
-                        self.idx += 1
-                    else:
-                        self.auto = False
-                        self._update_status()
-                else:
-                    plt.pause(0.01)
-            else:
-                plt.pause(0.05)
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    parser = argparse.ArgumentParser("Visualize GTZAN spectrogram + labels (from dataset) with keyboard controls")
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test", "all"],
-                        help="Which split to visualize [default: test]")
-    parser.add_argument("--train_ratio", type=float, default=0.8,
-                        help="Proportion of data for training (must match training) [default: 0.8]")
-    parser.add_argument("--val_ratio", type=float, default=0.1,
-                        help="Proportion of data for validation (must match training) [default: 0.1]")
-    parser.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt")
-    parser.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18"])
-    parser.add_argument("--topk", type=int, default=5)
-    parser.add_argument("--spec_auto_gain", action="store_true",
-                        help="Auto-adjust spectrogram color scale per frame using 5-95th percentile")
-    parser.add_argument("--sleep", type=float, default=0.6, help="Pause between samples when auto-advancing")
-    parser.add_argument("--sr", type=int, default=16000, help="Target sample rate to match training")
-    parser.add_argument("--duration", type=float, default=30.0, help="Seconds per clip (pad/trim to this, GTZAN uses 30s)")
-    parser.add_argument("--play_audio", action="store_true", help="Play the audio for each item")
-    parser.add_argument("--out_device", type=str, default=None, help="Sound output device index or substring")
-    args = parser.parse_args()
-
-    viewer = Viewer(args)
+# ---------- playback crackle-safe helpers ----------
+def _device_default_samplerate(device=None) -> int | None:
     try:
-        viewer.loop()
-    finally:
-        if sd is not None:
-            try:
-                sd.stop(ignore_errors=True)
-            except Exception:
-                pass
-        plt.ioff()
-        plt.show()
+        info = sd.query_devices(device, kind='output')
+        sr = info.get('default_samplerate', None)
+        if isinstance(sr, (int, float)) and sr > 0:
+            return int(round(sr))
+    except Exception:
+        pass
+    return None
 
+def _apply_fade(x: np.ndarray, sr: int, ms: float = 5.0) -> np.ndarray:
+    n = max(1, int(sr * (ms / 1000.0)))
+    if n*2 >= len(x):
+        return x
+    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    y = x.copy()
+    y[:n] *= w
+    y[-n:] *= w[::-1]
+    return y
+
+def _prepare_playback_audio(x_model_sr: np.ndarray, model_sr: int, out_sr: int) -> np.ndarray:
+    if out_sr != model_sr:
+        y = resample_poly(x_model_sr, out_sr, model_sr).astype(np.float32)
+    else:
+        y = x_model_sr.astype(np.float32, copy=False)
+    y = _apply_fade(y, out_sr, ms=5.0)
+    m = np.max(np.abs(y)) if y.size else 0.0
+    if m > 1.0:
+        y = y / m
+    return y
+
+# ---------- script ----------
+def main():
+    ap = argparse.ArgumentParser(
+        description="Visualize GTZAN spectrogram + labels with rolling updates and trend line"
+    )
+    ap.add_argument("--data_root", type=str, required=True)  # Path to GTZAN (genres_original)
+    ap.add_argument("--split", type=str, default="test", choices=["train", "val", "test", "all"])  # Which split to visualize
+    ap.add_argument("--train_ratio", type=float, default=0.8)  # Train split ratio if rebuilding splits
+    ap.add_argument("--val_ratio", type=float, default=0.1)    # Val split ratio if rebuilding splits
+
+    ap.add_argument("--checkpoint", type=str, default="artifacts/best_model.pt")  # Model weights to load
+    ap.add_argument("--model", type=str, default="resnet18", choices=["smallcnn", "resnet18"])  # Backbone to use
+    ap.add_argument("--topk", type=int, default=5)  # How many classes to display in bars
+
+    # feature/audio params (model side)
+    ap.add_argument("--sr", type=int, default=22050)       # Model sample rate (Hz)
+    ap.add_argument("--n_mels", type=int, default=128)     # Mel bins
+    ap.add_argument("--n_fft", type=int, default=1024)     # FFT size
+    ap.add_argument("--hop_length", type=int, default=512) # STFT hop (samples)
+    ap.add_argument("--duration", type=float, default=30.0)  # Seconds analyzed/played per item (default 30s)
+
+    # pacing / viz options
+    ap.add_argument("--hold_sec", type=float, default=None,  # Auto-advance dwell time; defaults to duration
+                    help="Seconds to keep each sample before auto-advance (defaults to duration).")
+    ap.add_argument("--spec_auto_gain", action="store_true")  # Enable per-frame percentile scaling
+    ap.add_argument("--spec_pmin", type=float, default=5.0)   # Lower percentile for auto-gain
+    ap.add_argument("--spec_pmax", type=float, default=95.0)  # Upper percentile for auto-gain
+    ap.add_argument("--sleep", type=float, default=0.02,      # UI tick pause (smaller -> smoother updates)
+                    help="UI tick pause (seconds).")
+    ap.add_argument("--play_audio", action="store_true")      # Play audio through sounddevice
+    ap.add_argument("--out_device", type=str, default=None)   # Output device name/index for playback
+    ap.add_argument("--out_sr", type=int, default=0,          # Output playback rate; 0=auto (device default)
+                    help="Output playback samplerate; 0 uses device default.")
+    ap.add_argument("--out_latency", type=str, default="high", choices=["low","high"])  # Playback latency preference
+
+    # rolling analysis window over the playing clip
+    ap.add_argument("--ana_win_sec", type=float, default=3.0,  # Length of analysis window (seconds)
+                    help="Rolling analysis window length (seconds).")
+    ap.add_argument("--ana_hop_sec", type=float, default=0.5,  # Time between rolling updates (seconds) — matches your HOP change
+                    help="Time between rolling updates (seconds).")
+
+    # shuffle control
+    ap.add_argument("--no_shuffle", action="store_true",      # Disable shuffling; keep sequential order
+                    help="Disable random shuffling of sample order (sequential order).")
+
+    args = ap.parse_args()
+    hold_sec = args.hold_sec if args.hold_sec is not None else args.duration  # dwell time per item
+
+    # Output playback configuration
+    try:
+        sd.default.device = (None, args.out_device) if args.out_device is not None else None  # set output device
+    except Exception:
+        pass
+    if args.out_latency == "high":
+        sd.default.latency = ('high', 'high')  # robust, crackle-free defaults
+    if args.out_sr and args.out_sr > 0:
+        out_sr = int(args.out_sr)  # explicit playback rate
+    else:
+        out_sr = _device_default_samplerate(args.out_device) or 44100  # device default or fallback
+
+    device = get_device()
+    print(f"Using device: {get_device_name()} ({device}) | playback_sr={out_sr}")
+
+    # classes
+    class_map_path = Path("artifacts") / "class_map.json"  # where train.py saved idx2name
+    if class_map_path.exists():
+        try:
+            class_names = _read_json_classmap(class_map_path)
+        except Exception:
+            class_names = GTZAN_GENRES
+    else:
+        class_names = GTZAN_GENRES
+    num_classes = len(class_names)  # total classes for model head and bars
+
+    # dataset
+    ds = GTZAN(
+        root=args.data_root,
+        split=args.split if args.split != "all" else "train",
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        target_sr=args.sr,
+        duration=args.duration,
+        n_mels=args.n_mels,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        augment=None,
+    )
+    if args.split == "all":
+        d_val = GTZAN(args.data_root, "val", args.train_ratio, args.val_ratio,
+                      args.sr, args.duration, args.n_mels, args.n_fft, args.hop_length, None)
+        d_tst = GTZAN(args.data_root, "test", args.train_ratio, args.val_ratio,
+                      args.sr, args.duration, args.n_mels, args.n_fft, args.hop_length, None)
+        class _Concat:
+            def __init__(self, parts):
+                self.parts = parts
+                self.cum = np.cumsum([0] + [len(p) for p in parts])
+            def __len__(self): return self.cum[-1]
+            def __getitem__(self, i):
+                k = np.searchsorted(self.cum, i, side="right") - 1
+                return self.parts[k][i - self.cum[k]]
+        ds = _Concat([ds, d_val, d_tst])
+
+    print(f"Dataset split='{args.split}' size={len(ds)}")
+
+    # shuffled (or sequential) index order for this run
+    order = np.arange(len(ds))  # permutation over dataset indices
+    if args.no_shuffle:
+        print("Playback order: sequential")
+    else:
+        rng = np.random.default_rng()  # different order each execution
+        rng.shuffle(order)
+        print("Playback order: shuffled")
+
+    def _current_ds_index(pos: int) -> int:
+        return int(order[pos])  # map position -> dataset index
+
+    # model
+    state = torch.load(args.checkpoint, map_location=device)
+    state = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
+    model = build_model(args.model, num_classes=num_classes).to(device)
+    model.load_state_dict(state)
+    model.eval()
+
+    # mel transform on CPU
+    mel_t = get_mel_transform(
+        sample_rate=args.sr,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        n_mels=args.n_mels,
+    )
+
+    # figure layout: left = spectrogram; right = [bars over trend]
+    plt.ion()
+    fig = plt.figure(figsize=(12, 7))  # main figure for spec + bars + trend
+    outer = gridspec.GridSpec(1, 2, width_ratios=[3, 2], wspace=0.25, bottom=0.18, left=0.06, right=0.98, top=0.90)
+    ax_spec = fig.add_subplot(outer[0, 0])  # spectrogram axis
+
+    right = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[0, 1], height_ratios=[3, 1], hspace=0.35)
+    ax_bar   = fig.add_subplot(right[0, 0])  # top-k bars axis
+    ax_trend = fig.add_subplot(right[1, 0])  # top-1 probability over time
+
+    # spectrogram
+    init_img = np.random.randn(args.n_mels, 64) * 1e-6  # tiny noise prevents colormap solid block
+    im = ax_spec.imshow(init_img, origin="lower", aspect="auto")
+    ax_spec.set_xlabel("Frames")
+    ax_spec.set_ylabel("Mel bins")
+    ax_spec.set_title("Spectrogram (rolling window)")
+
+    # bars
+    topk = max(1, min(args.topk, num_classes))  # ensure 1..num_classes
+    bars = ax_bar.barh(range(topk), np.zeros(topk), align="center")
+    ax_bar.set_xlim(0.0, 1.0)
+    ax_bar.set_yticks(range(topk))
+    ax_bar.set_yticklabels([""] * topk)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("Probability")
+    ax_bar.set_title(f"Top-{topk} predictions")
+    bar_texts = [ax_bar.text(0.0, i, "", va="center", ha="left", fontsize=9) for i in range(topk)]  # percentage labels
+
+    # trend line (top-1 prob vs time in this clip)
+    ax_trend.set_xlim(0.0, args.duration)  # span 0..duration (now 30s by default)
+    ax_trend.set_ylim(0.0, 1.0)
+    (trend_line,) = ax_trend.plot([], [], linewidth=2)  # top-1 p line
+    trend_dot = ax_trend.plot([], [], marker="o")[0]    # latest point marker
+    ax_trend.set_xlabel("Time (s)")
+    ax_trend.set_ylabel("Top-1 p")
+    ax_trend.grid(True, alpha=0.3)
+    ax_trend.set_title("Top-1 trend")
+
+    # state
+    pos = 0                      # position inside 'order' permutation
+    autoplay = True              # whether to auto-advance after hold_sec
+    playing = False              # whether audio is currently playing
+    last_clim = None             # last spectrogram clim (for auto-gain smoothing)
+    last_show_ts = None          # wall-clock when current item was shown
+    play_start_ts = None         # wall-clock when audio started
+    last_ana_ts = None           # last time we ran rolling analysis
+    wav_model_sr = None          # current audio (mono) at model SR
+    ana_win = float(args.ana_win_sec)                 # analysis window length (sec)
+    ana_hop = max(0.02, float(args.ana_hop_sec))      # analysis hop (sec), default 0.5s
+
+    trend_t = []  # times (sec) for trend line
+    trend_p = []  # top-1 probabilities for trend line
+
+    # ---- per-item helpers ----
+    def _predict_window_ending_at(end_sec: float, win_sec: float):
+        """
+        Slice a window that ENDS at end_sec (align with current playback time).
+        If not enough audio yet, pad on the LEFT so that the RIGHT edge is 'now'.
+        """
+        assert wav_model_sr is not None
+        sr = args.sr
+        T = len(wav_model_sr)
+        end_sec = max(0.0, min(end_sec, args.duration))
+        end_n = int(round(end_sec * sr))
+        end_n = max(0, min(end_n, T))
+        win_n = int(round(min(win_sec, args.duration) * sr))
+        start_n = max(0, end_n - win_n)
+
+        seg = wav_model_sr[start_n:end_n]
+        if len(seg) < win_n:
+            pad_left = win_n - len(seg)
+            seg = np.pad(seg, (pad_left, 0))
+        seg_t = torch.from_numpy(seg).unsqueeze(0)  # [1, T]
+        logmel = wav_to_logmel(seg_t, sr=sr, mel_transform=mel_t)
+        logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-6)
+        with torch.no_grad():
+            feats = logmel.unsqueeze(0).to(device)  # [1,1,n_mels,time]
+            logits = model(feats)
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+        mel_img = logmel.squeeze(0).cpu().numpy()
+        return probs, mel_img
+
+    def _update_viz(probs: np.ndarray, mel_img: np.ndarray, gt_idx: int):
+        nonlocal last_clim
+        order_idx = np.argsort(probs)[::-1][:topk]
+        top_probs = probs[order_idx]
+        top_names = [class_names[j] if j < len(class_names) else f"class_{j}" for j in order_idx]
+        pred_idx = int(order_idx[0])
+        pred_name = top_names[0]
+        gt_name = class_names[int(gt_idx)] if 0 <= int(gt_idx) < len(class_names) else f"class_{int(gt_idx)}"
+        correct = (pred_idx == int(gt_idx))
+
+        xmax = max(1.0, float(top_probs[0]) * 1.1)
+        ax_bar.set_xlim(0.0, xmax)
+        ax_bar.set_yticklabels(top_names)
+        for k, (bar, p) in enumerate(zip(bars, top_probs)):
+            width = float(p)
+            bar.set_width(width)
+            label = f"{100.0 * width:.1f}%"
+            thresh_inside = 0.18 * xmax
+            if width >= thresh_inside:
+                x_text = max(0.0, width - 0.02 * xmax)
+                ha, color = "right", "white"
+            else:
+                x_text = min(width + 0.02 * xmax, xmax * 0.98)
+                ha, color = "left", "black"
+            bar_texts[k].set_text(label)
+            bar_texts[k].set_x(x_text)
+            bar_texts[k].set_y(k)
+            bar_texts[k].set_ha(ha)
+            bar_texts[k].set_color(color)
+
+        vmin, vmax = _compute_spec_limits(mel_img, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim)
+        if args.spec_auto_gain:
+            im.set_clim(vmin=vmin, vmax=vmax)
+            last_clim = (vmin, vmax)
+        im.set_data(mel_img)
+
+        color = "green" if correct else "red"
+        fig.suptitle(f"Pred: {pred_name}  |  GT: {gt_name}", color=color, fontsize=12)
+        fig.canvas.draw_idle()
+        return float(top_probs[0])
+
+    def _reset_trend():
+        trend_t.clear()
+        trend_p.clear()
+        trend_line.set_data([], [])
+        trend_dot.set_data([], [])
+        ax_trend.set_xlim(0.0, args.duration)  # keep trend span matched to duration (now 30s)
+        ax_trend.set_ylim(0.0, 1.0)
+
+    def _append_trend(t_sec: float, p_top1: float):
+        t_sec = max(0.0, min(t_sec, args.duration))
+        trend_t.append(t_sec)
+        trend_p.append(float(p_top1))
+        trend_line.set_data(trend_t, trend_p)
+        trend_dot.set_data([t_sec], [p_top1])
+
+    def show_item_at_pos():
+        """Show the item at current 'pos' (mapped through shuffled 'order')."""
+        nonlocal wav_model_sr, playing, last_ana_ts, play_start_ts
+        _reset_trend()
+
+        ds_idx = _current_ds_index(pos)
+        x, y, meta = ds[ds_idx]
+        wav_path = Path(meta.get("path", "")) if isinstance(meta, dict) else None
+        wav_model_sr = None
+        if wav_path and wav_path.exists():
+            wav_model_sr = _load_wav_centered(wav_path, args.sr, args.duration)
+
+        if wav_model_sr is not None:
+            probs, mel_img = _predict_window_ending_at(0.0, ana_win)
+            top1 = _update_viz(probs, mel_img, gt_idx=int(y))
+            _append_trend(0.0, top1)
+        else:
+            logmel = x if isinstance(x, torch.Tensor) else torch.tensor(x)
+            if logmel.dim() == 2:
+                logmel = logmel.unsqueeze(0)
+            with torch.no_grad():
+                feats = logmel.unsqueeze(0).to(device)
+                logits = model(feats)
+                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            top1 = _update_viz(probs, logmel.squeeze(0).cpu().numpy(), gt_idx=int(y))
+            _append_trend(0.0, top1)
+
+        if args.play_audio and wav_model_sr is not None:
+            try:
+                sd.stop()
+                wav_out = _prepare_playback_audio(wav_model_sr, model_sr=args.sr, out_sr=out_sr)
+                sd.play(wav_out, samplerate=out_sr, device=args.out_device)
+                playing = True
+                play_start_ts = time.time()
+                last_ana_ts = None
+            except Exception as e:
+                print(f"[warn] audio playback failed: {e}")
+                playing = False
+                play_start_ts = time.time()
+                last_ana_ts = None
+        else:
+            playing = False
+            play_start_ts = time.time()
+            last_ana_ts = None
+
+    def _show_and_stamp():
+        nonlocal last_show_ts
+        show_item_at_pos()
+        last_show_ts = time.time()
+
+    def on_key(event):
+        nonlocal pos, autoplay, playing
+        if event.key in ("left", "left_arrow"):
+            autoplay = False
+            pos = (pos - 1) % len(order)
+            _show_and_stamp()
+        elif event.key in ("right", "right_arrow"):
+            autoplay = False
+            pos = (pos + 1) % len(order)
+            _show_and_stamp()
+        elif event.key == " ":
+            autoplay = not autoplay
+            tag = "▶️ autoplay" if autoplay else "⏸ autoplay"
+            fig.suptitle(fig._suptitle.get_text() + f"  |  {tag}", fontsize=12)
+            fig.canvas.draw_idle()
+        elif event.key in ("p", "P"):
+            if playing:
+                sd.stop()
+                playing = False
+            else:
+                if wav_model_sr is not None:
+                    try:
+                        sd.stop()
+                        wav_out = _prepare_playback_audio(wav_model_sr, model_sr=args.sr, out_sr=out_sr)
+                        sd.play(wav_out, samplerate=out_sr, device=args.out_device)
+                        playing = True
+                    except Exception as e:
+                        print(f"[warn] audio playback failed: {e}")
+        elif event.key in ("q","Q"):
+            plt.close(fig)
+
+    # init
+    cid = fig.canvas.mpl_connect("key_press_event", on_key)
+    _show_and_stamp()
+
+    # autoplay + rolling updates loop
+    try:
+        while plt.fignum_exists(fig.number):
+            now = time.time()
+            plt.pause(args.sleep)
+
+            # Rolling analysis updates while current item is active
+            if wav_model_sr is not None and play_start_ts is not None:
+                elapsed = max(0.0, min(now - play_start_ts, args.duration))
+                if (last_ana_ts is None) or ((now - last_ana_ts) >= ana_hop):
+                    probs, mel_img = _predict_window_ending_at(end_sec=elapsed, win_sec=ana_win)
+                    ds_idx = _current_ds_index(pos)
+                    _, y, _ = ds[ds_idx]
+                    top1 = _update_viz(probs, mel_img, gt_idx=int(y))
+                    _append_trend(elapsed, top1)
+                    last_ana_ts = now
+
+            # Auto-advance by hold_sec
+            if (autoplay and (last_show_ts is not None)
+                and ((now - last_show_ts) >= hold_sec)):
+                pos = (pos + 1) % len(order)
+                _show_and_stamp()
+    finally:
+        try:
+            fig.canvas.mpl_disconnect(cid)
+        except Exception:
+            pass
+        sd.stop()
 
 if __name__ == "__main__":
     main()
-    
