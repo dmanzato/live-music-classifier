@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 Real-time streaming genre inference from microphone / audio device.
 
@@ -7,7 +8,7 @@ Keys:
 
 Example:
   PYTHONPATH=. python scripts/stream_infer.py \
-    --data_root /Users/dmanzato/devel/data/GTZAN/genres_original \
+    --data_root /Users/you/data/GTZAN/genres_original \
     --checkpoint artifacts/best_model.pt \
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
@@ -22,11 +23,11 @@ from pathlib import Path
 import queue
 from collections import deque
 import sys
+import time
 
 import numpy as np
 import sounddevice as sd
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 
@@ -179,7 +180,7 @@ def main():
     buf = np.zeros(window_size, dtype=np.float32)
     q = queue.Queue()
 
-    def callback(indata, frames, time, status):
+    def callback(indata, frames, time_info, status):
         if status:
             print(status)
         q.put(indata.copy())
@@ -195,7 +196,7 @@ def main():
     # figure layout:
     #   left: spectrogram (rowspan=2)
     #   right-top: top-K bars (+ % text)
-    #   right-bottom: rolling top-1 trend
+    #   right-bottom: rolling top-1 trend (past→now)
     plt.ion()
     fig = plt.figure(figsize=(12, 6))
     gs = gridspec.GridSpec(2, 2, width_ratios=[3, 2], height_ratios=[3, 1], wspace=0.25, hspace=0.35)
@@ -204,13 +205,18 @@ def main():
     ax_trend = fig.add_subplot(gs[1, 1])         # bottom-right
 
     # init spec image with tiny noise to avoid vmin==vmax
+    # extent maps x to seconds: left=-win_sec (oldest), right=0 (now)
     init_img = np.random.randn(args.n_mels, 64) * 1e-6
-    spec_img = ax_spec.imshow(init_img, origin="lower", aspect="auto")
+    spec_img = ax_spec.imshow(
+        init_img, origin="lower", aspect="auto",
+        extent=[-args.win_sec, 0.0, 0.0, float(args.n_mels)]
+    )
     ax_spec.set_title("Spectrogram")
-    ax_spec.set_xlabel("Frames")
+    ax_spec.set_xlabel("Time (s, past → now)")
     ax_spec.set_ylabel("Mel bins")
+    ax_spec.set_xlim(-args.win_sec, 0.0)
 
-    # init bars + value labels
+    # init bars + value labels (UNCHANGED)
     topk = max(1, min(args.topk, num_classes))
     bars = ax_bar.barh(range(topk), np.zeros(topk), align="center")
     ax_bar.set_xlim(0.0, 1.0)
@@ -221,15 +227,25 @@ def main():
     ax_bar.set_title(f"Top-{topk} predictions")
     bar_texts = [ax_bar.text(0.0, i, "", va="center", ha="left", fontsize=9) for i in range(topk)]
 
-    # trend buffers and line
+    # ---- trend buffers and line: negative time axis (past → now at 0) ----
     trend_len = max(2, args.trend_len)
-    xs = np.arange(trend_len) * args.hop_sec  # seconds
+    xs = -np.arange(trend_len - 1, -1, -1, dtype=float) * args.hop_sec  # e.g., [-59.5..0]
     trend_buf = deque([np.nan] * trend_len, maxlen=trend_len)
     ema_val = None if args.trend_ema <= 0.0 else 0.0
     (trend_line,) = ax_trend.plot(xs, [np.nan] * trend_len, lw=2)
     ax_trend.set_ylim(0.0, 1.0)
-    ax_trend.set_xlim(xs[0], xs[-1] if len(xs) > 1 else trend_len)
-    ax_trend.set_xlabel("Time (s)")
+    ax_trend.set_xlim(xs[0], xs[-1])  # e.g., -60 .. 0
+    # ticks every ~10s up to 0
+    try:
+        total_span = abs(xs[0])
+        step = 10.0
+        ticks = np.arange(-np.floor(total_span / step) * step, step, step)
+        if 0.0 not in ticks:
+            ticks = np.append(ticks, 0.0)
+        ax_trend.set_xticks(ticks)
+    except Exception:
+        pass
+    ax_trend.set_xlabel("Time (s, past → now)")
     ax_trend.set_ylabel("Top-1 p")
     ax_trend.grid(True, alpha=0.25)
     if ema_val is not None:
@@ -237,8 +253,9 @@ def main():
     else:
         ema_line = None
 
-    # for stable color scaling when auto_gain is off
+    # spectrogram clim management
     last_clim = None
+    first_spec_frame = True  # ensure clim is set once even if auto-gain is off
 
     # ------------- keyboard controls -------------
     state = {"paused": False, "running": True}
@@ -298,7 +315,7 @@ def main():
                     logits = model(feats)
                     probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-                # top-k
+                # top-k (UNCHANGED bars)
                 order = np.argsort(probs)[::-1][:topk]
                 top_probs = probs[order]
                 top_names = [class_names[i] if i < len(class_names) else f"class_{i}" for i in order]
@@ -331,45 +348,44 @@ def main():
 
                 ax_bar.set_yticklabels(top_names)
 
-                # update spec image with sane color scaling
-                vmin, vmax = _compute_spec_limits(mel_img, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim)
-                if args.spec_auto_gain:
+                # ---- spectrogram image with proper, consistent scaling ----
+                vmin, vmax = _compute_spec_limits(
+                    mel_img, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim
+                )
+                # If auto-gain: update clim every frame.
+                # If not: set clim at least once on first real frame (prevents the "all purple" issue).
+                if args.spec_auto_gain or first_spec_frame:
                     spec_img.set_clim(vmin=vmin, vmax=vmax)
                     last_clim = (vmin, vmax)
+                    first_spec_frame = False
                 spec_img.set_data(mel_img)
+                # keep negative-time extent each frame (robust if win_sec changes)
+                spec_img.set_extent([-args.win_sec, 0.0, 0.0, float(args.n_mels)])
+                ax_spec.set_xlim(-args.win_sec, 0.0)
 
                 # title w/ top-1
                 pred_label = top_names[0]
                 pred_prob = float(top_probs[0])
                 fig.suptitle(f"{pred_label} ({pred_prob*100:4.1f}%)", fontsize=12)
 
-                # update trend buffers/lines
+                # ---- update trend: newest prob goes at x=0 (right edge) ----
                 trend_buf.append(pred_prob)
                 y = np.array(trend_buf, dtype=float)
+                trend_line.set_xdata(xs)  # fixed negative-time axis
                 trend_line.set_ydata(y)
 
                 if ema_line is not None:
                     alpha = float(args.trend_ema)
-                    # Initialize EMA at first valid prob
-                    if np.isnan(y[-1]):
-                        pass
-                    else:
-                        non_nan = y[~np.isnan(y)]
-                        if len(non_nan) and (np.isnan(ema_val) or ema_val is None):
-                            ema = non_nan[-1]
+                    ema_series = []
+                    prev = None
+                    for v in y:
+                        if np.isnan(v):
+                            ema_series.append(np.nan)
                         else:
-                            ema = alpha * y[-1] + (1.0 - alpha) * (ema_val if ema_val is not None else y[-1])
-                        ema_val_local = ema
-                        ema_series = []
-                        prev = ema_val if ema_val is not None else y[-1]
-                        for v in y:
-                            if np.isnan(v):
-                                ema_series.append(np.nan)
-                            else:
-                                prev = alpha * v + (1.0 - alpha) * prev
-                                ema_series.append(prev)
-                        ema_line.set_ydata(np.array(ema_series, dtype=float))
-                        ema_val = ema_val_local
+                            prev = v if prev is None else (alpha * v + (1.0 - alpha) * prev)
+                            ema_series.append(prev)
+                    ema_line.set_xdata(xs)
+                    ema_line.set_ydata(np.array(ema_series, dtype=float))
 
                 if args.spec_debug:
                     print(f"spec range: vmin={vmin:.3f} vmax={vmax:.3f}; "

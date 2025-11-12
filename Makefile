@@ -54,7 +54,7 @@ HOLD ?= $(DUR)
 # Top-K classes shown in bars
 TOPK ?= 5
 # Rolling analysis window length (sec)
-WIN ?= 3.0
+WIN ?= 6.0
 # Rolling analysis hop between updates (sec)
 HOP ?= 0.5
 # Dataset split to visualize (train|val|test|all)
