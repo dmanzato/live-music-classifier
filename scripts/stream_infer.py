@@ -12,9 +12,8 @@ Example:
     --checkpoint artifacts/best_model.pt \
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
-    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
-    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
-    --trend_len 120 --trend_ema 0.0
+    --win_sec 15 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
 """
 
 import argparse
@@ -31,7 +30,7 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 
-from transforms.audio import get_mel_transform, wav_to_logmel
+from transforms.audio import get_mel_transform  # we'll compute mel here, log/pcen below
 from utils.device import get_device, get_device_name
 from utils.models import build_model
 
@@ -39,7 +38,6 @@ GTZAN_GENRES = [
     "blues", "classical", "country", "disco", "hiphop",
     "jazz", "metal", "pop", "reggae", "rock"
 ]
-
 
 # ----------------- helpers -----------------
 def _read_json_classmap(p: Path):
@@ -51,7 +49,6 @@ def _read_json_classmap(p: Path):
         return data
     raise ValueError("Invalid class_map.json format")
 
-
 def _infer_classes_from_data_root(root: Path):
     root = root / "genres" if (root / "genres").exists() else root
     if not root.exists():
@@ -59,7 +56,6 @@ def _infer_classes_from_data_root(root: Path):
     names = [d.name for d in root.iterdir() if d.is_dir()]
     present = [g for g in GTZAN_GENRES if g in names]
     return present if len(present) >= 2 else sorted(names)
-
 
 def _detect_num_classes_from_state_dict(state_dict: dict) -> int:
     # Works for ResNet (fc.weight) and many small heads
@@ -73,13 +69,11 @@ def _detect_num_classes_from_state_dict(state_dict: dict) -> int:
             return v.shape[0]
     return len(GTZAN_GENRES)
 
-
 def _load_checkpoint(checkpoint_path: Path, device: torch.device):
     state = torch.load(checkpoint_path, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         return state["state_dict"]
     return state
-
 
 def _compute_spec_limits(mel_img: np.ndarray, auto_gain: bool, pmin: float, pmax: float, prev=None):
     """Compute (vmin, vmax) for the spectrogram, supporting per-frame auto-gain."""
@@ -98,7 +92,6 @@ def _compute_spec_limits(mel_img: np.ndarray, auto_gain: bool, pmin: float, pmax
                 hi = lo + 1e-6
             return lo, hi
         return prev
-
 
 # ----------------- main -----------------
 def main():
@@ -204,38 +197,38 @@ def main():
     ax_bar  = fig.add_subplot(gs[0, 1])          # top-right
     ax_trend = fig.add_subplot(gs[1, 1])         # bottom-right
 
-    # init spec image with tiny noise to avoid vmin==vmax
-    # extent maps x to seconds: left=-win_sec (oldest), right=0 (now)
+    # spectrogram image (negative time axis, past→now)
     init_img = np.random.randn(args.n_mels, 64) * 1e-6
     spec_img = ax_spec.imshow(
         init_img, origin="lower", aspect="auto",
-        extent=[-args.win_sec, 0.0, 0.0, float(args.n_mels)]
+        extent=[-args.win_sec, 0.0, 0.0, float(args.n_mels)],
+        cmap='magma',
+        interpolation='nearest'
     )
     ax_spec.set_title("Spectrogram")
     ax_spec.set_xlabel("Time (s, past → now)")
     ax_spec.set_ylabel("Mel bins")
     ax_spec.set_xlim(-args.win_sec, 0.0)
 
-    # init bars + value labels (UNCHANGED)
+    # Top-K bars (+ percentages) — unchanged visual behavior
     topk = max(1, min(args.topk, num_classes))
     bars = ax_bar.barh(range(topk), np.zeros(topk), align="center")
     ax_bar.set_xlim(0.0, 1.0)
     ax_bar.set_yticks(range(topk))
     ax_bar.set_yticklabels([""] * topk)
-    ax_bar.invert_yaxis()  # top-1 at top
+    ax_bar.invert_yaxis()
     ax_bar.set_xlabel("Probability")
     ax_bar.set_title(f"Top-{topk} predictions")
     bar_texts = [ax_bar.text(0.0, i, "", va="center", ha="left", fontsize=9) for i in range(topk)]
 
-    # ---- trend buffers and line: negative time axis (past → now at 0) ----
+    # Trend line with negative x (past→now at 0)
     trend_len = max(2, args.trend_len)
     xs = -np.arange(trend_len - 1, -1, -1, dtype=float) * args.hop_sec  # e.g., [-59.5..0]
     trend_buf = deque([np.nan] * trend_len, maxlen=trend_len)
     ema_val = None if args.trend_ema <= 0.0 else 0.0
     (trend_line,) = ax_trend.plot(xs, [np.nan] * trend_len, lw=2)
     ax_trend.set_ylim(0.0, 1.0)
-    ax_trend.set_xlim(xs[0], xs[-1])  # e.g., -60 .. 0
-    # ticks every ~10s up to 0
+    ax_trend.set_xlim(xs[0], xs[-1])
     try:
         total_span = abs(xs[0])
         step = 10.0
@@ -255,7 +248,7 @@ def main():
 
     # spectrogram clim management
     last_clim = None
-    first_spec_frame = True  # ensure clim is set once even if auto-gain is off
+    first_spec_frame = True
 
     # ------------- keyboard controls -------------
     state = {"paused": False, "running": True}
@@ -290,8 +283,6 @@ def main():
                 if L == 0:
                     continue
 
-                # Even while paused, consume the queue to avoid growth,
-                # but skip processing/visual update.
                 if state["paused"]:
                     plt.pause(0.001)
                     continue
@@ -303,15 +294,25 @@ def main():
                     buf = np.roll(buf, -L)
                     buf[-L:] = data
 
-                # CPU mel
-                wav = torch.from_numpy(buf).unsqueeze(0)  # [1, T], CPU
-                logmel = wav_to_logmel(wav, sr=args.sr, mel_transform=mel_t)  # [1, n_mels, time], CPU
-                logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-6)
-                mel_img = logmel.squeeze(0).cpu().numpy()  # [n_mels, time]
+                # === feature extraction on CPU ===
+                x = buf.astype(np.float32, copy=False)
+                wav_t = torch.from_numpy(x).unsqueeze(0)  # [1, T]
+
+                # Power mel
+                mel = mel_t(wav_t).squeeze(0).cpu().numpy()  # [n_mels, time], power
+
+                # Log-mel (standard approach)
+                mel_feat = np.log10(mel + 1e-6)
+
+                # Store raw mel_feat for visualization (before standardization)
+                mel_feat_raw = mel_feat.copy()
+
+                # Per-clip standardization for inference (matches training)
+                mel_feat = (mel_feat - mel_feat.mean()) / (mel_feat.std() + 1e-6)
 
                 # inference on device
                 with torch.no_grad():
-                    feats = logmel.unsqueeze(0).to(device)  # [B=1, 1, n_mels, time]
+                    feats = torch.from_numpy(mel_feat).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,n_mels,time]
                     logits = model(feats)
                     probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
@@ -348,20 +349,18 @@ def main():
 
                 ax_bar.set_yticklabels(top_names)
 
-                # ---- spectrogram image with proper, consistent scaling ----
+                # ---- spectrogram image: use RAW mel_feat for better visualization ----
                 vmin, vmax = _compute_spec_limits(
-                    mel_img, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim
+                    mel_feat_raw, args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim
                 )
-                # If auto-gain: update clim every frame.
-                # If not: set clim at least once on first real frame (prevents the "all purple" issue).
+                spec_img.set_data(mel_feat_raw)
+                spec_img.set_extent([-args.win_sec, 0.0, 0.0, float(args.n_mels)])
+                ax_spec.set_xlim(-args.win_sec, 0.0)
+
                 if args.spec_auto_gain or first_spec_frame:
                     spec_img.set_clim(vmin=vmin, vmax=vmax)
                     last_clim = (vmin, vmax)
                     first_spec_frame = False
-                spec_img.set_data(mel_img)
-                # keep negative-time extent each frame (robust if win_sec changes)
-                spec_img.set_extent([-args.win_sec, 0.0, 0.0, float(args.n_mels)])
-                ax_spec.set_xlim(-args.win_sec, 0.0)
 
                 # title w/ top-1
                 pred_label = top_names[0]
@@ -371,7 +370,7 @@ def main():
                 # ---- update trend: newest prob goes at x=0 (right edge) ----
                 trend_buf.append(pred_prob)
                 y = np.array(trend_buf, dtype=float)
-                trend_line.set_xdata(xs)  # fixed negative-time axis
+                trend_line.set_xdata(xs)
                 trend_line.set_ydata(y)
 
                 if ema_line is not None:
@@ -389,7 +388,8 @@ def main():
 
                 if args.spec_debug:
                     print(f"spec range: vmin={vmin:.3f} vmax={vmax:.3f}; "
-                          f"mel mean={mel_img.mean():.3f} std={mel_img.std():.3f}; "
+                          f"mel_raw mean={mel_feat_raw.mean():.3f} std={mel_feat_raw.std():.3f}; "
+                          f"mel_feat mean={mel_feat.mean():.3f} std={mel_feat.std():.3f}; "
                           f"top1={pred_label}:{pred_prob:.3f}")
 
                 plt.pause(0.001)
@@ -410,7 +410,6 @@ def main():
         except Exception:
             pass
         sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
