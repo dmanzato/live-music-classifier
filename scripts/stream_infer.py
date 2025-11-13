@@ -13,7 +13,8 @@ Example:
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
     --win_sec 15 --hop_sec 0.5 --topk 5 \
-    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --auto_gain_norm
 """
 
 import argparse
@@ -33,6 +34,11 @@ from matplotlib import gridspec
 from transforms.audio import get_mel_transform  # we'll compute mel here, log/pcen below
 from utils.device import get_device, get_device_name
 from utils.models import build_model
+
+# For matching training pipeline: AmplitudeToDB with stype="power" uses 10*log10
+def power_to_db(power_spec: np.ndarray, ref: float = 1.0, amin: float = 1e-10) -> np.ndarray:
+    """Convert power spectrogram to decibel scale (matches AmplitudeToDB with stype='power')."""
+    return 10.0 * np.log10(np.maximum(power_spec, amin) / ref)
 
 GTZAN_GENRES = [
     "blues", "classical", "country", "disco", "hiphop",
@@ -118,6 +124,8 @@ def main():
     ap.add_argument("--spec_pmin", type=float, default=5.0, help="Lower percentile (auto-gain)")
     ap.add_argument("--spec_pmax", type=float, default=95.0, help="Upper percentile (auto-gain)")
     ap.add_argument("--spec_debug", action="store_true")
+    ap.add_argument("--input_gain", type=float, default=1.0, help="Input gain multiplier (1.0=no change, >1.0=boost)")
+    ap.add_argument("--auto_gain_norm", action="store_true", help="Auto-normalize input gain based on signal level")
 
     # trend line options
     ap.add_argument("--trend_len", type=int, default=120, help="Number of hops to keep in trend buffer")
@@ -268,6 +276,10 @@ def main():
     # ---------------------------------------------
 
     print("🎙️  Streaming... (SPACE=pause/resume, q=quit)")
+    if args.auto_gain_norm:
+        print("📊 Auto gain normalization enabled (helps with external audio sources)")
+    elif args.input_gain != 1.0:
+        print(f"📊 Input gain set to {args.input_gain:.2f}x")
     try:
         with stream:
             while state["running"]:
@@ -296,13 +308,32 @@ def main():
 
                 # === feature extraction on CPU ===
                 x = buf.astype(np.float32, copy=False)
+                
+                # Input gain normalization (helps with external audio sources)
+                if args.auto_gain_norm:
+                    # Normalize to a target RMS level (0.1 is a reasonable level for speech/music)
+                    target_rms = 0.1
+                    current_rms = np.sqrt(np.mean(x**2))
+                    if current_rms > 1e-6:  # Avoid division by zero
+                        gain = target_rms / current_rms
+                        # Limit gain to reasonable range (0.1x to 10x)
+                        gain = np.clip(gain, 0.1, 10.0)
+                        x = x * gain
+                else:
+                    # Apply manual gain
+                    x = x * args.input_gain
+                
+                # Clip to prevent overflow
+                x = np.clip(x, -1.0, 1.0)
+                
                 wav_t = torch.from_numpy(x).unsqueeze(0)  # [1, T]
 
                 # Power mel
                 mel = mel_t(wav_t).squeeze(0).cpu().numpy()  # [n_mels, time], power
 
-                # Log-mel (standard approach)
-                mel_feat = np.log10(mel + 1e-6)
+                # Log-mel in decibel scale (matches training: AmplitudeToDB with stype="power")
+                # Training uses: 10 * log10(x), not just log10(x)
+                mel_feat = power_to_db(mel, ref=1.0, amin=1e-10)
 
                 # Store raw mel_feat for visualization (before standardization)
                 mel_feat_raw = mel_feat.copy()
