@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis to show fixed range [-60, 0] with 0 on right-hand side (matching `stream_infer.py`)
 - Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis ticks to exclude -60 label (matching `stream_infer.py`)
 - Fixed `test_dataset.py` to match current GTZAN API (split values, sample rate defaults, and attribute names)
+- Fixed `test_dataset.py` to properly assert dataset initialization (removed silent exception handling)
+- Fixed `test_utils.py` normalization test tolerance for floating-point precision (relaxed std check from 1e-5 to 1e-4)
 
 ## [0.2.1] - 2025-01-13
 
