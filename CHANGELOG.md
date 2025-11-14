@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `gen_demo_gif.py` demo_stream.gif warmup period to 60s (fills entire trend x-axis) with 30s capture period (total 90s)
 - Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis to show fixed range [-60, 0] with 0 on right-hand side (matching `stream_infer.py`)
 - Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis ticks to exclude -60 label (matching `stream_infer.py`)
+- Fixed `test_dataset.py` to match current GTZAN API (split values, sample rate defaults, and attribute names)
 
 ## [0.2.1] - 2025-01-13
 
