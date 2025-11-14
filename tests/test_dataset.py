@@ -44,13 +44,12 @@ class TestGTZAN:
             try:
                 dataset = GTZAN(
                     root=data_root,
-                    split='all',
-                    target_sr=16000,
+                    split='train',
+                    target_sr=22050,
                     duration=30.0,
                 )
                 # If it gets here, structure is correct
-                assert hasattr(dataset, 'filepaths')
-                assert hasattr(dataset, 'labels')
+                assert hasattr(dataset, 'items')
                 assert hasattr(dataset, 'GENRES')
                 assert len(dataset.GENRES) == 10
             except Exception:
@@ -69,7 +68,7 @@ class TestGTZAN:
                     split='train',
                     train_ratio=0.8,
                     val_ratio=0.1,
-                    target_sr=16000,
+                    target_sr=22050,
                     duration=30.0,
                 )
                 dataset_val = GTZAN(
@@ -77,7 +76,7 @@ class TestGTZAN:
                     split='val',
                     train_ratio=0.8,
                     val_ratio=0.1,
-                    target_sr=16000,
+                    target_sr=22050,
                     duration=30.0,
                 )
                 dataset_test = GTZAN(
@@ -85,14 +84,14 @@ class TestGTZAN:
                     split='test',
                     train_ratio=0.8,
                     val_ratio=0.1,
-                    target_sr=16000,
+                    target_sr=22050,
                     duration=30.0,
                 )
                 # Note: actual len may differ due to file existence checks
                 # But splits should be different
-                assert len(dataset_train.filepaths) > 0 or len(dataset_train.filepaths) == 0
-                assert len(dataset_val.filepaths) > 0 or len(dataset_val.filepaths) == 0
-                assert len(dataset_test.filepaths) > 0 or len(dataset_test.filepaths) == 0
+                assert len(dataset_train.items) >= 0
+                assert len(dataset_val.items) >= 0
+                assert len(dataset_test.items) >= 0
             except Exception:
                 pass  # Expected if audio files don't exist
     
@@ -104,19 +103,19 @@ class TestGTZAN:
             try:
                 dataset = GTZAN(
                     root=data_root,
-                    split='all',
-                    target_sr=16000,
+                    split='train',
+                    target_sr=22050,
                     duration=30.0,
                 )
                 
                 # Check class mapping structure
-                assert hasattr(dataset, 'class_ids')
-                assert hasattr(dataset, 'id2idx')
+                assert hasattr(dataset, 'name2idx')
                 assert hasattr(dataset, 'idx2name')
                 
                 # Check that mappings are consistent
                 assert len(dataset.GENRES) == 10
                 for i, genre in enumerate(dataset.GENRES):
                     assert dataset.idx2name[i] == genre
+                    assert dataset.name2idx[genre] == i
             except Exception:
                 pass  # Expected if audio files don't exist
