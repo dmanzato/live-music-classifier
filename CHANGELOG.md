@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2025-01-13
+
+### Changed
+- Updated `gen_demo_gif.py` to match UI of `stream_infer.py` and `vis_dataset.py`:
+  - Stream mode: negative time axis (past → now), no trend title, fixed x-axis range [-60, 0] with ticks [-50, -40, -30, -20, -10, 0]
+  - Vis mode: positive time axis, trend title, proper title format with GT comparison
+  - Both modes: matching figure sizes, grid alpha, and spectrogram styling
+- Updated `Makefile` demo targets with optimized parameters for GIF generation
+- Updated `gen_demo_gif.py` to use raw mel spectrogram (before normalization) for visualization, matching `stream_infer.py`
+
+### Fixed
+- Fixed `gen_demo_gif.py` demo_vis.gif to capture exactly 61 frames (30s cycle) instead of multiple files × 61 frames
+- Fixed `gen_demo_gif.py` demo_stream.gif spectrogram fade-out issue by looping audio instead of padding with zeros
+- Fixed `gen_demo_gif.py` demo_stream.gif warmup period to 60s (fills entire trend x-axis) with 30s capture period (total 90s)
+- Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis to show fixed range [-60, 0] with 0 on right-hand side (matching `stream_infer.py`)
+- Fixed `gen_demo_gif.py` demo_stream.gif trend x-axis ticks to exclude -60 label (matching `stream_infer.py`)
+
 ## [0.2.1] - 2025-01-13
 
 ### Changed

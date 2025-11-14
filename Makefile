@@ -151,6 +151,11 @@ vis:
 	  --play_audio --out_latency high \
 	  $(VIS_SHUFFLE_FLAG)
 
+# Demo GIF parameters (shorter duration for smaller file size)
+DEMO_DUR ?= 12.0
+DEMO_WIN ?= 15.0
+DEMO_HOP ?= 0.5
+
 # ------------------------------------------------------------
 # DEMO GIF (VIS STYLE ONLY)
 # ------------------------------------------------------------
@@ -163,7 +168,7 @@ demo:
 	  --model $(MODEL) \
 	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN) \
 	  --mode vis \
-	  --duration $(DUR) --ana_win_sec $(WIN) --ana_hop_sec $(HOP) \
+	  --duration $(DEMO_DUR) --ana_win_sec 3.0 --ana_hop_sec 0.25 \
 	  --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
 	  --out docs/demo_vis.gif \
 	  --max_files 6
@@ -179,7 +184,7 @@ demo_all:
 	  --checkpoint "$(CHECKPOINT)" \
 	  --model $(MODEL) \
 	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN) \
-	  --duration $(DUR) --ana_win_sec $(WIN) --ana_hop_sec $(HOP) \
+	  --duration $(DEMO_DUR) --ana_win_sec $(DEMO_WIN) --ana_hop_sec $(DEMO_HOP) \
 	  --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
 	  --out_vis docs/demo_vis.gif \
 	  --out_stream docs/demo_stream.gif \

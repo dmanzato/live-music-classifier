@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from pathlib import Path
 import numpy as np
 import torch
@@ -101,7 +102,16 @@ def _compute_spec_limits(mel_img: np.ndarray, auto_gain: bool, pmin: float, pmax
             return lo, hi
         return prev
 
-def _load_wav_centered(path: Path, target_sr: int, duration: float) -> tuple[np.ndarray, int]:
+def _load_wav_centered(path: Path, target_sr: int, duration: float, loop: bool = False) -> tuple[np.ndarray, int]:
+    """
+    Load WAV file and center/crop or loop to match duration.
+    
+    Args:
+        path: Path to WAV file
+        target_sr: Target sample rate
+        duration: Desired duration in seconds
+        loop: If True and audio is shorter than duration, loop it instead of padding with zeros
+    """
     x, sr = sf.read(str(path), dtype="float32", always_2d=True)
     x = x.mean(axis=1) if x.shape[1] > 1 else x[:, 0]
     if sr != target_sr:
@@ -109,9 +119,15 @@ def _load_wav_centered(path: Path, target_sr: int, duration: float) -> tuple[np.
         sr = target_sr
     N = int(duration * sr)
     if len(x) < N:
-        pad = N - len(x)
-        left, right = pad // 2, pad - pad // 2
-        x = np.pad(x, (left, right))
+        if loop:
+            # Loop the audio to fill the required duration
+            num_loops = int(np.ceil(N / len(x)))
+            x = np.tile(x, num_loops)[:N]
+        else:
+            # Pad with zeros (original behavior)
+            pad = N - len(x)
+            left, right = pad // 2, pad - pad // 2
+            x = np.pad(x, (left, right))
     else:
         start = max(0, (len(x) - N) // 2)
         x = x[start:start + N]
@@ -172,9 +188,20 @@ def _fig_to_rgb(fig):
         raise RuntimeError(f"Could not extract RGB buffer from canvas: {e}")
 
 # -------------------- Core drawing --------------------
-def _init_figure(n_mels: int, duration: float, topk: int) -> tuple[plt.Figure, dict]:
+def _init_figure(n_mels: int, duration: float, topk: int, win_sec: float, mode: str) -> tuple[plt.Figure, dict]:
+    """
+    Initialize figure with layout matching stream_infer.py (stream mode) or vis_dataset.py (vis mode).
+    
+    Args:
+        n_mels: Number of mel bins
+        duration: Total duration for vis mode
+        topk: Number of top predictions to show
+        win_sec: Window size in seconds (for stream mode negative time axis)
+        mode: "stream" or "vis"
+    """
     plt.ioff()
-    fig = plt.figure(figsize=(12, 7))
+    # Match figure sizes: stream_infer.py uses (12, 6), vis_dataset.py uses (12, 7)
+    fig = plt.figure(figsize=(12, 6) if mode == "stream" else (12, 7))
     outer = gridspec.GridSpec(1, 2, width_ratios=[3, 2], wspace=0.25, bottom=0.18, left=0.06, right=0.98, top=0.90)
     ax_spec = fig.add_subplot(outer[0, 0])
 
@@ -184,10 +211,25 @@ def _init_figure(n_mels: int, duration: float, topk: int) -> tuple[plt.Figure, d
 
     # spectrogram placeholder (tiny noise so it's not a solid color)
     init_img = np.random.randn(n_mels, 64) * 1e-6
-    im = ax_spec.imshow(init_img, origin="lower", aspect="auto")
-    ax_spec.set_xlabel("Frames")
-    ax_spec.set_ylabel("Mel bins")
-    ax_spec.set_title("Spectrogram (rolling window)")
+    
+    if mode == "stream":
+        # Stream mode: negative time axis (past → now at 0), matching stream_infer.py
+        im = ax_spec.imshow(
+            init_img, origin="lower", aspect="auto",
+            extent=[-win_sec, 0.0, 0.0, float(n_mels)],
+            cmap='magma',
+            interpolation='nearest'
+        )
+        ax_spec.set_xlabel("Time (s, past → now)")
+        ax_spec.set_ylabel("Mel bins")
+        ax_spec.set_title("Spectrogram")
+        ax_spec.set_xlim(-win_sec, 0.0)
+    else:
+        # Vis mode: frames axis, matching vis_dataset.py
+        im = ax_spec.imshow(init_img, origin="lower", aspect="auto")
+        ax_spec.set_xlabel("Frames")
+        ax_spec.set_ylabel("Mel bins")
+        ax_spec.set_title("Spectrogram (rolling window)")
 
     # bars
     bars = ax_bar.barh(range(topk), np.zeros(topk), align="center")
@@ -200,19 +242,48 @@ def _init_figure(n_mels: int, duration: float, topk: int) -> tuple[plt.Figure, d
     bar_texts = [ax_bar.text(0.0, i, "", va="center", ha="left", fontsize=9) for i in range(topk)]
 
     # trend line
-    ax_trend.set_xlim(0.0, duration)
+    if mode == "stream":
+        # Stream mode: negative time axis (past → now)
+        # Fixed range [-60, 0] with 0 on right-hand side (matching user requirement)
+        ax_trend.set_xlim(-60.0, 0.0)  # Fixed range: 0 on right-hand side y-axis
+        ax_trend.set_xlabel("Time (s, past → now)")
+        # Set ticks matching stream_infer.py: -50, -40, -30, -20, -10, 0 (NO -60)
+        # stream_infer.py calculates: total_span = abs(xs[0]) where xs[0] ≈ -59.5, then
+        # ticks = np.arange(-np.floor(59.5/10)*10, 10, 10) = np.arange(-50, 10, 10) = [-50, -40, -30, -20, -10]
+        # then adds 0.0 if not present: [-50, -40, -30, -20, -10, 0]
+        # We use xlim [-60, 0] but calculate ticks the same way (based on span, not xlim)
+        step = 10.0
+        # Calculate ticks the same way as stream_infer.py (using span, not xlim)
+        # With x-axis range [-60, 0], the span is 60, but we calculate ticks as if span is ~59.5
+        # to match stream_infer.py behavior (which uses xs[0] ≈ -59.5)
+        total_span = 59.5  # Match stream_infer.py's xs[0] value
+        ticks = np.arange(-np.floor(total_span / step) * step, step, step)  # [-50, -40, -30, -20, -10]
+        if 0.0 not in ticks:
+            ticks = np.append(ticks, 0.0)  # [-50, -40, -30, -20, -10, 0]
+        ax_trend.set_xticks(ticks)
+        # Set xlim to [-60, 0] (fixed range, but ticks don't include -60, matching stream_infer.py)
+        ax_trend.set_xlim(-60.0, 0.0)
+    else:
+        # Vis mode: positive time from 0 to duration
+        ax_trend.set_xlim(0.0, duration)
+        ax_trend.set_xlabel("Time (s)")
+    
     ax_trend.set_ylim(0.0, 1.0)
     (trend_line,) = ax_trend.plot([], [], linewidth=2)
     trend_dot = ax_trend.plot([], [], marker="o")[0]
-    ax_trend.set_xlabel("Time (s)")
     ax_trend.set_ylabel("Top-1 p")
-    ax_trend.grid(True, alpha=0.3)
-    ax_trend.set_title("Top-1 trend")
+    ax_trend.grid(True, alpha=0.25 if mode == "stream" else 0.3)
+    # Stream mode: no title (matching stream_infer.py)
+    # Vis mode: has title (matching vis_dataset.py)
+    if mode != "stream":
+        ax_trend.set_title("Top-1 trend")
 
     return fig, dict(
         ax_spec=ax_spec, im=im,
         ax_bar=ax_bar, bars=bars, bar_texts=bar_texts,
-        ax_trend=ax_trend, trend_line=trend_line, trend_dot=trend_dot
+        ax_trend=ax_trend, trend_line=trend_line, trend_dot=trend_dot,
+        mode=mode, win_sec=win_sec,
+        first_spec_frame=True  # Track first frame for clim update
     )
 
 def _update_viz(fig: plt.Figure,
@@ -227,9 +298,12 @@ def _update_viz(fig: plt.Figure,
                 last_clim: tuple[float,float] | None,
                 pred_idx_gt: tuple[int | None, int | None]) -> tuple[float, tuple[float,float] | None]:
     """
-    Update spectrogram, bars (with percentages), and title color by correctness. Return (top1, new_clim).
+    Update spectrogram, bars (with percentages), and title. Return (top1, new_clim).
+    Matches title format from stream_infer.py (stream mode) or vis_dataset.py (vis mode).
     """
     im = vis["im"]; ax_bar = vis["ax_bar"]; bars = vis["bars"]; bar_texts = vis["bar_texts"]
+    mode = vis.get("mode", "vis")
+    win_sec = vis.get("win_sec", 15.0)
 
     order = np.argsort(probs)[::-1][:topk]
     top_probs = probs[order]
@@ -252,27 +326,48 @@ def _update_viz(fig: plt.Figure,
         bar_texts[k].set_x(x_text); bar_texts[k].set_y(k)
         bar_texts[k].set_ha(ha);    bar_texts[k].set_color(color)
 
-    # spectrogram intensity scaling
+    # spectrogram intensity scaling - matching stream_infer.py order
     vmin, vmax = _compute_spec_limits(mel_img, spec_auto_gain, spec_pmin, spec_pmax, last_clim)
-    if spec_auto_gain:
+    
+    # Update spectrogram data FIRST (matching stream_infer.py order)
+    im.set_data(mel_img)
+    
+    # Update spectrogram extent for stream mode (negative time axis)
+    if mode == "stream":
+        # Get n_mels from mel_img shape
+        n_mels = mel_img.shape[0] if len(mel_img.shape) >= 2 else 128
+        # Always show the most recent win_sec window: [-win_sec, 0.0]
+        # This ensures continuous scrolling as new data arrives
+        im.set_extent([-win_sec, 0.0, 0.0, float(n_mels)])
+        vis["ax_spec"].set_xlim(-win_sec, 0.0)
+    
+    # Update color limits - matching stream_infer.py: only if auto_gain OR first frame
+    first_frame = vis.get("first_spec_frame", True)
+    if spec_auto_gain or first_frame:
         im.set_clim(vmin=vmin, vmax=vmax)
         last_clim = (vmin, vmax)
-    im.set_data(mel_img)
+        vis["first_spec_frame"] = False
 
-    # title color by correctness if GT known (stream mode: gt_idx=None)
+    # title format matching stream_infer.py (stream) or vis_dataset.py (vis)
     pred_idx, gt_idx = pred_idx_gt
-    pred_name = class_names[pred_idx] if pred_idx is not None and pred_idx < len(class_names) else ("?" if pred_idx is None else f"class_{pred_idx}")
     top1_prob = float(top_probs[0])
-    title = f"Pred: {pred_name} ({100.0 * top1_prob:.1f}%)"
-
-    if gt_idx is not None and 0 <= gt_idx < len(class_names):
-        gt_name = class_names[gt_idx]
-        title += f"  |  GT: {gt_name}"
-        color = "green" if (pred_idx == gt_idx) else "red"
-        fig.suptitle(title, color=color, fontsize=12)
-    else:
-        # stream mode / unknown GT → no color kwarg
+    
+    if mode == "stream":
+        # Stream mode: format like stream_infer.py - "{label} ({prob:4.1f}%)"
+        pred_name = class_names[pred_idx] if pred_idx is not None and pred_idx < len(class_names) else ("?" if pred_idx is None else f"class_{pred_idx}")
+        title = f"{pred_name} ({top1_prob*100:4.1f}%)"
         fig.suptitle(title, fontsize=12)
+    else:
+        # Vis mode: format like vis_dataset.py - "Pred: {name}  |  GT: {name}" with color
+        pred_name = class_names[pred_idx] if pred_idx is not None and pred_idx < len(class_names) else ("?" if pred_idx is None else f"class_{pred_idx}")
+        if gt_idx is not None and 0 <= gt_idx < len(class_names):
+            gt_name = class_names[gt_idx]
+            title = f"Pred: {pred_name}  |  GT: {gt_name}"
+            color = "green" if (pred_idx == gt_idx) else "red"
+            fig.suptitle(title, color=color, fontsize=12)
+        else:
+            title = f"Pred: {pred_name}"
+            fig.suptitle(title, fontsize=12)
 
     return top1_prob, last_clim
 
@@ -362,36 +457,59 @@ def main():
         """Compute probs + mel image for a 1D float32 segment (model sr)."""
         seg_t = torch.from_numpy(seg).unsqueeze(0)  # [1, T]
         logmel = wav_to_logmel(seg_t, sr=args.sr, mel_transform=mel_t)
-        # match viewer normalization
-        logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-6)
+        # Store raw mel for visualization (before normalization) - matching stream_infer.py
+        mel_img_raw = logmel.squeeze(0).cpu().numpy()
+        # Normalize for model inference
+        logmel_norm = (logmel - logmel.mean()) / (logmel.std() + 1e-6)
         with torch.no_grad():
-            feats = logmel.unsqueeze(0).to(device)  # [1,1,n_mels,time]
+            feats = logmel_norm.unsqueeze(0).to(device)  # [1,1,n_mels,time]
             logits = model(feats)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-        mel_img = logmel.squeeze(0).cpu().numpy()
-        return probs, mel_img
+        # Return raw mel for visualization (matching stream_infer.py behavior)
+        return probs, mel_img_raw
 
     def simulate_stream_frames(wav_path: Path) -> list[np.ndarray]:
         """
         Single-file 'stream' style:
         - Slide a window ending at t from 0..duration by ana_hop_sec
         - For each step, update viz and capture a frame
+        - Uses negative time axis (past → now) matching stream_infer.py
+        - Fixed trend x-axis range [-60, 0] with 0 on right-hand side
         NOTE: No GT label is shown in stream mode.
         """
-        x, _ = _load_wav_centered(wav_path, args.sr, args.duration)
+        # Load audio and loop it if needed to fill the full duration (90s)
+        # This ensures continuous audio throughout warmup and capture periods
+        x, _ = _load_wav_centered(wav_path, args.sr, args.duration, loop=True)
         topk = max(1, min(args.topk, num_classes))
-        fig, vis = _init_figure(args.n_mels, args.duration, topk)
+        win_sec = args.ana_win_sec
+        fig, vis = _init_figure(args.n_mels, args.duration, topk, win_sec, mode="stream")
         frames: list[np.ndarray] = []
         last_clim = None
 
         # In stream mode, do NOT show GT (even if file path reveals genre)
         gt_idx = None
 
-        trend_t: list[float] = []
-        trend_p: list[float] = []
+        # For stream mode, use negative time (past → now at 0)
+        # Build trend buffer similar to stream_infer.py with fixed range [-60, 0]
+        # trend_len=120 with hop_sec=0.5 gives 120 points from -59.5 to 0.0
+        # But we want fixed x-axis range [-60, 0] with 0 on the right-hand side
+        trend_len = 120  # Match stream_infer.py default
+        trend_buf = deque([np.nan] * trend_len, maxlen=trend_len)
+        # Calculate x-axis points: with hop_sec=0.5, we get [-59.5, -59.0, ..., -0.5, 0.0]
+        # This gives 120 points, but xlim is fixed to [-60, 0] so 0 appears on the right
+        trend_xs = -np.arange(trend_len - 1, -1, -1, dtype=float) * args.ana_hop_sec
 
         times = np.arange(0.0, args.duration + 1e-6, args.ana_hop_sec)
         win_n = int(round(min(args.ana_win_sec, args.duration) * args.sr))
+
+        # Calculate warm-up period: 90s to ensure trend buffer is fully populated
+        # With trend_len=120 and hop_sec=0.5, we need 60s to fill completely, but 90s ensures stability
+        # Then capture for 30s after warmup (total 120s duration)
+        warmup_seconds = 90.0  # Extended warmup for stable trend buffer
+        capture_seconds = 30.0  # Capture for 30s after warmup
+        warmup_frames = int(warmup_seconds / args.ana_hop_sec) if args.ana_hop_sec > 0 else 0
+        capture_frames = int(capture_seconds / args.ana_hop_sec) if args.ana_hop_sec > 0 else 60
+        frame_count = 0
 
         for t in times:
             end_n = int(round(min(t, args.duration) * args.sr))
@@ -404,18 +522,40 @@ def main():
             order = np.argsort(probs)[::-1]
             pred_idx = int(order[0]) if probs.size else None
 
-            top1, last_clim = _update_viz(
-                fig, vis, probs, mel_img, class_names, topk,
-                args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim,
-                (pred_idx, gt_idx)  # gt_idx=None hides GT in title
-            )
+            frame_count += 1
+            
+            # Only update visualization and capture frames after warm-up period
+            # This ensures the spectrogram shows fresh data when capture starts
+            if warmup_frames < frame_count <= warmup_frames + capture_frames:
+                # Reset first_spec_frame flag when we start capturing to ensure clim is set correctly
+                if frame_count == warmup_frames + 1:
+                    vis["first_spec_frame"] = True
+                    last_clim = None  # Reset clim to ensure fresh calculation
+                
+                top1, last_clim = _update_viz(
+                    fig, vis, probs, mel_img, class_names, topk,
+                    args.spec_auto_gain, args.spec_pmin, args.spec_pmax, last_clim,
+                    (pred_idx, gt_idx)  # gt_idx=None hides GT in title
+                )
 
-            # update trend
-            vis["trend_line"].set_data(trend_t + [t], trend_p + [top1])
-            vis["trend_dot"].set_data([t], [top1])
-            trend_t.append(t); trend_p.append(top1)
+                # Update trend with negative time (past → now)
+                # Append newest value (most recent at x=0, older points go negative)
+                trend_buf.append(top1)
+                
+                # Use fixed x-axis range [-60, 0] - don't update limits dynamically
+                # The x-axis is already fixed in _init_figure, just update the data
+                y_data = np.array(list(trend_buf), dtype=float)
+                vis["trend_line"].set_data(trend_xs, y_data)
+                vis["trend_dot"].set_data([0.0], [top1])  # Current point at x=0
 
-            frames.append(_fig_to_rgb(fig))
+                frames.append(_fig_to_rgb(fig))
+            else:
+                # During warmup, still update trend buffer but don't update visualization
+                # This ensures the trend graph is ready when capture starts
+                order = np.argsort(probs)[::-1]
+                pred_idx_temp = int(order[0]) if probs.size else None
+                top1_temp = float(probs[order[0]]) if probs.size else 0.0
+                trend_buf.append(top1_temp)
 
         plt.close(fig)
         return frames
@@ -425,6 +565,8 @@ def main():
         Multi-file 'vis' style:
         - For each file: simulate rolling updates across the clip and append frames.
         - Keeps same viz layout; title shows Pred | GT colorized.
+        - Uses positive time axis (0 to duration) matching vis_dataset.py
+        - Captures full cycle from 0 to duration (full x-axis span of trend graph)
         """
         if args.shuffle:
             rng = np.random.default_rng()
@@ -433,23 +575,34 @@ def main():
 
         wavs = wavs[: args.max_files]
         topk = max(1, min(args.topk, num_classes))
-        fig, vis = _init_figure(args.n_mels, args.duration, topk)
+        win_sec = args.ana_win_sec
+        # For vis mode, use duration=30.0 to span full trend graph (0 to 30s)
+        vis_duration = 30.0  # Full cycle matching vis_dataset.py default
+        fig, vis = _init_figure(args.n_mels, vis_duration, topk, win_sec, mode="vis")
         frames: list[np.ndarray] = []
         last_clim = None
 
+        # Limit TOTAL frames to 61 (30s cycle: 1 frame at t=0 + 60 frames from 0.5s to 30s)
+        max_total_frames = 61
+        total_frame_count = 0
+
         for i, wp in enumerate(wavs):
+            if total_frame_count >= max_total_frames:
+                break  # Stop if we've reached the total frame limit
+                
             # reset trend for each new clip
             vis["trend_line"].set_data([], [])
             vis["trend_dot"].set_data([], [])
             trend_t: list[float] = []
             trend_p: list[float] = []
 
-            x, _ = _load_wav_centered(wp, args.sr, args.duration)
+            # Load full 30s clip for vis mode
+            x, _ = _load_wav_centered(wp, args.sr, vis_duration)
             gt_name = _gt_from_path(wp)
             gt_idx = class_names.index(gt_name) if (gt_name in class_names) else None
 
             # first immediate frame (t=0)
-            win_n = int(round(min(args.ana_win_sec, args.duration) * args.sr))
+            win_n = int(round(min(args.ana_win_sec, vis_duration) * args.sr))
             seg0 = x[max(0, 0 - win_n):0]
             if len(seg0) < win_n:
                 seg0 = np.pad(seg0, (win_n - len(seg0), 0))
@@ -464,11 +617,19 @@ def main():
             vis["trend_dot"].set_data([0.0], [top10])
             trend_t = [0.0]; trend_p = [top10]
             frames.append(_fig_to_rgb(fig))
+            total_frame_count += 1
+            
+            if total_frame_count >= max_total_frames:
+                break  # Stop if we've reached the total frame limit
 
-            # rolling frames
-            times = np.arange(args.ana_hop_sec, args.duration + 1e-6, args.ana_hop_sec)
+            # rolling frames: capture only until we reach 61 total frames
+            times = np.arange(args.ana_hop_sec, vis_duration + 1e-6, args.ana_hop_sec)
+            
             for t in times:
-                end_n = int(round(min(t, args.duration) * args.sr))
+                if total_frame_count >= max_total_frames:
+                    break  # Stop after 61 total frames (30s cycle)
+                    
+                end_n = int(round(min(t, vis_duration) * args.sr))
                 start_n = max(0, end_n - win_n)
                 seg = x[start_n:end_n]
                 if len(seg) < win_n:
@@ -487,6 +648,10 @@ def main():
                 trend_t.append(t); trend_p.append(top1)
 
                 frames.append(_fig_to_rgb(fig))
+                total_frame_count += 1
+                
+                if total_frame_count >= max_total_frames:
+                    break  # Stop after 61 total frames
 
         plt.close(fig)
         return frames
@@ -527,13 +692,24 @@ def main():
         print(f"Saved demo GIF → {out_path}  ({len(pal_imgs)} frames @ {fps} fps)")
 
     # Build outputs as requested
+    # Ensure both GIFs have similar frame counts (~60 frames at 12 fps = ~5 seconds)
+    # For stream mode: use duration that gives ~60 frames with ana_hop_sec
+    # For vis mode: use 30.0s duration with ana_hop_sec=0.5 gives 60 frames
     if args.mode:
         # Single mode → single output (--out)
         wavs = _glob_wavs(Path(args.inputs))
         if args.mode == "stream":
             # pick first WAV
+            # Adjust duration: 90s warmup + 30s capture = 120s total
+            warmup_seconds = 90.0
+            capture_seconds = 30.0
+            stream_duration = warmup_seconds + capture_seconds
+            # Temporarily override args.duration for stream mode
+            original_duration = args.duration
+            args.duration = stream_duration
             src = wavs[0]
             frames = simulate_stream_frames(src)
+            args.duration = original_duration
         else:
             frames = multi_vis_frames(wavs)
         write_gif(frames, Path(args.out), args.fps)
@@ -542,7 +718,14 @@ def main():
         wavs = _glob_wavs(Path(args.inputs))
         if args.out_stream:
             src = wavs[0]
+            # Adjust duration: 90s warmup + 30s capture = 120s total
+            warmup_seconds = 90.0
+            capture_seconds = 30.0
+            stream_duration = warmup_seconds + capture_seconds
+            original_duration = args.duration
+            args.duration = stream_duration
             frames = simulate_stream_frames(src)
+            args.duration = original_duration
             write_gif(frames, Path(args.out_stream), args.fps)
         if args.out_vis:
             frames = multi_vis_frames(wavs)
