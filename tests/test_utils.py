@@ -7,6 +7,66 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from utils.normalization import normalize_per_sample
+
+
+class TestNormalization:
+    """Test normalization utilities."""
+    
+    def test_normalize_per_sample_shape(self):
+        """Test that normalize_per_sample preserves input shape."""
+        batch_size = 4
+        n_mels = 128
+        time_frames = 250
+        
+        x = torch.randn(batch_size, 1, n_mels, time_frames)
+        x_norm = normalize_per_sample(x)
+        
+        assert x_norm.shape == x.shape
+    
+    def test_normalize_per_sample_statistics(self):
+        """Test that normalize_per_sample produces mean≈0 and std≈1 per sample."""
+        batch_size = 2
+        n_mels = 64
+        time_frames = 100
+        
+        x = torch.randn(batch_size, 1, n_mels, time_frames)
+        x_norm = normalize_per_sample(x)
+        
+        # Check each sample in the batch
+        for i in range(batch_size):
+            sample = x_norm[i, 0, :, :]
+            mean = sample.mean().item()
+            std = sample.std().item()
+            
+            # Mean should be close to 0
+            assert abs(mean) < 1e-5, f"Sample {i} mean should be ≈0, got {mean}"
+            # Std should be close to 1
+            assert abs(std - 1.0) < 1e-5, f"Sample {i} std should be ≈1, got {std}"
+    
+    def test_normalize_per_sample_different_inputs(self):
+        """Test that different inputs produce different normalized outputs."""
+        x1 = torch.randn(2, 1, 64, 100)
+        x2 = torch.randn(2, 1, 64, 100) * 2.0 + 5.0  # Different scale and offset
+        
+        x1_norm = normalize_per_sample(x1)
+        x2_norm = normalize_per_sample(x2)
+        
+        # After normalization, both should have similar statistics
+        assert abs(x1_norm.mean().item()) < 1e-5
+        assert abs(x2_norm.mean().item()) < 1e-5
+        assert abs(x1_norm.std().item() - 1.0) < 1e-5
+        assert abs(x2_norm.std().item() - 1.0) < 1e-5
+    
+    def test_normalize_per_sample_constant_input(self):
+        """Test that constant input is handled correctly."""
+        # Constant input (all zeros or all same value)
+        x = torch.ones(2, 1, 64, 100)
+        x_norm = normalize_per_sample(x)
+        
+        # Should handle division by zero gracefully (std + 1e-6 prevents division by zero)
+        assert torch.isfinite(x_norm).all()
+
 
 class TestTensorUtils:
     """Test tensor utility functions."""

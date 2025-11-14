@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="live-music-classifier",
-    version="0.1.0",
+    version="0.2.1",
     author="Daniel A. G. Manzato",
     author_email="dmanzato@gmail.com",
     description="Live music genre classification using PyTorch and GTZAN dataset",

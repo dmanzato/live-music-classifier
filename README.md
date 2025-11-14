@@ -52,15 +52,15 @@ live-music-classifier/
 ├── models/
 │   └── small_cnn.py      # CNN architecture definitions
 ├── datasets/
-│   ├── gtzan.py          # GTZAN dataset loader
-│   └── urbansound8k.py   # Legacy UrbanSound8K loader (from migration)
+│   └── gtzan.py          # GTZAN dataset loader
 ├── transforms/
 │   └── audio.py          # Audio preprocessing & augmentation
 ├── utils/
 │   ├── models.py         # Shared model building utilities
 │   ├── class_map.py      # Class map loading/saving utilities
 │   ├── device.py          # Device selection utilities (CPU/CUDA/MPS)
-│   └── logging.py        # Logging configuration
+│   ├── logging.py         # Logging configuration
+│   └── normalization.py  # Per-sample spectrogram normalization utilities
 ├── scripts/
 │   ├── stream_infer.py   # Live microphone streaming inference
 │   ├── vis_dataset.py    # Interactive dataset browser with rolling analysis
@@ -234,7 +234,9 @@ GTZAN/
 └── rock/
 ```
 
-2) Example run (default parameters: sr=22050, n_mels=128, n_fft=1024, hop_length=512):
+2) Example run (default parameters: sr=22050, n_mels=128, n_fft=1024, hop_length=512, duration=5.0):
+
+> **Note**: GTZAN audio files are 30 seconds long, but the default `--duration` is 5.0 seconds for faster training. You can set `--duration 30.0` to use full-length clips, or any other duration that fits your needs.
 
 ```bash
 python train.py \
@@ -337,8 +339,9 @@ live-music-stream \
     --checkpoint artifacts/best_model.pt \
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
-    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
-    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
+    --win_sec 15 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --auto_gain_norm
 
 # Or using Python directly
 python scripts/stream_infer.py \
@@ -346,13 +349,14 @@ python scripts/stream_infer.py \
     --checkpoint artifacts/best_model.pt \
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
-    --win_sec 7.5 --hop_sec 0.5 --topk 5 \
-    --spec_auto_gain --spec_pmin 5 --spec_pmax 95
+    --win_sec 15 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --auto_gain_norm
 ```
 
 **Features**
 
-- **Rolling window buffer** (default 7.5 seconds) with configurable length  
+- **Rolling window buffer** (default 15 seconds) with configurable length  
 - **Live spectrogram** with auto-gain color scaling (percentile-based)  
 - **Top-K predictions** with horizontal bar chart and percentage labels  
 - **Trend line visualization** showing top-1 probability over time (with optional EMA smoothing)  

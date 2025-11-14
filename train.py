@@ -20,6 +20,7 @@ from utils.logging import setup_logging, get_logger
 from utils.device import get_device, get_device_name
 from utils.models import build_model
 from utils.class_map import save_class_map
+from utils.normalization import normalize_per_sample
 
 logger = get_logger("train")
 
@@ -37,16 +38,6 @@ def _unpack_batch(batch):
             x, y, meta = batch
             return x, y, meta
     return batch, None, None
-
-
-def _normalize_per_sample(x: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize each sample's spectrogram: (x - mean) / (std + eps)
-    Expects x = [B,1,H,W] (log-mel).
-    """
-    mean = x.mean(dim=(2, 3), keepdim=True)
-    std = x.std(dim=(2, 3), keepdim=True)
-    return (x - mean) / (std + 1e-6)
 
 
 def mixup_batch(x, y, alpha=0.0):
@@ -99,7 +90,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_cla
             x, y, _ = _unpack_batch(batch)
             x = x.to(device)
             y = y.to(device)
-            x = _normalize_per_sample(x)
+            x = normalize_per_sample(x)
             logits = model(x)
             pred = logits.argmax(dim=1)
             ys.append(y.cpu().numpy())
@@ -305,7 +296,7 @@ def main():
         for batch_idx, batch in enumerate(train_dl):
             x, y, _ = _unpack_batch(batch)
             x, y = x.to(device), y.to(device)
-            x = _normalize_per_sample(x)
+            x = normalize_per_sample(x)
 
             # mixup
             x_in, y_in, mix = mixup_batch(x, y, alpha=args.mixup_alpha)

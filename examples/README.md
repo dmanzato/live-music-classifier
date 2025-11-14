@@ -1,10 +1,10 @@
 # Examples
 
-This directory contains example scripts and a Jupyter notebook demonstrating how to use live-audio-classifier.
+This directory contains example scripts and a Jupyter notebook demonstrating how to use live-music-classifier.
 
 ## Jupyter Notebook
 
-For an interactive tutorial, open `live-audio-classifier-tutorial.ipynb` in Jupyter:
+For an interactive tutorial, open `live-music-classifier-tutorial.ipynb` in Jupyter:
 - Load and inspect the dataset
 - Create and test models
 - Run inference and visualize results
@@ -66,9 +66,11 @@ For real-time microphone input:
 python scripts/stream_infer.py \
     --data_root /path/to/GTZAN \
     --checkpoint artifacts/best_model.pt \
-    --model smallcnn \
-    --win_sec 4.0 \
-    --hop_sec 0.25
+    --model resnet18 \
+    --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
+    --win_sec 15 --hop_sec 0.5 --topk 5 \
+    --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+    --auto_gain_norm
 ```
 
 ### 5. Dataset Visualization
@@ -107,7 +109,7 @@ Switch between them using the `--model` flag:
 
 1. **First time setup**: Make sure you have the GTZAN dataset downloaded and extracted
 2. **Training**: Start with SmallCNN for faster iteration, then try ResNet18 for better accuracy
-3. **Inference**: The model expects 30-second audio clips at 16kHz sample rate (GTZAN standard)
+3. **Inference**: The model expects audio clips at 22050Hz sample rate (GTZAN standard). Default duration is 5.0 seconds, but can be configured to match training.
 4. **Live streaming**: Use `--device` flag to select a specific microphone if you have multiple
 
 ## Troubleshooting

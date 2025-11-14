@@ -8,7 +8,7 @@ Keys:
 
 Example:
   PYTHONPATH=. python scripts/stream_infer.py \
-    --data_root /Users/you/data/GTZAN/genres_original \
+    --data_root /path/to/GTZAN/genres_original \
     --checkpoint artifacts/best_model.pt \
     --model resnet18 \
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
@@ -113,7 +113,7 @@ def main():
     ap.add_argument("--hop_length", type=int, default=512)
 
     # streaming params
-    ap.add_argument("--win_sec", type=float, default=7.5)
+    ap.add_argument("--win_sec", type=float, default=15.0)
     ap.add_argument("--hop_sec", type=float, default=0.5)
     ap.add_argument("--device", type=str, default=None, help="Sounddevice input id or substring")
     ap.add_argument("--list-devices", action="store_true")

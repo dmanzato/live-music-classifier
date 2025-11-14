@@ -16,10 +16,11 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report, con
 import numpy as np
 import pandas as pd
 
-from datasets.gtzan import GTZAN
+from datasets.gtzan import GTZAN, GENRES
 from utils.device import get_device, get_device_name
 from utils.logging import setup_logging, get_logger
 from utils.models import build_model
+from utils.normalization import normalize_per_sample
 
 logger = get_logger("evaluate")
 
@@ -41,12 +42,19 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, c
     all_labels = []
     
     with torch.no_grad():
-        for x, y in loader:
+        for batch in loader:
+            # Handle both (x, y) and (x, y, meta) formats
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                x, y = batch[0], batch[1]
+            else:
+                x, y = batch, None
+            
             x = x.to(device)
+            x = normalize_per_sample(x)  # Match training pipeline
             logits = model(x)
             preds = logits.argmax(dim=1).cpu().numpy()
             all_preds.extend(preds)
-            all_labels.extend(y.numpy())
+            all_labels.extend(y.numpy() if y is not None else [])
     
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
@@ -94,11 +102,11 @@ def main():
                        help="Path to ResNet18 checkpoint. If not found, tries artifacts/best_model.pt")
     parser.add_argument("--batch_size", type=int, default=32,
                        help="Batch size for evaluation [default: 32]")
-    parser.add_argument("--sr", type=int, default=16000, help="Sample rate [default: 16000]")
-    parser.add_argument("--n_mels", type=int, default=64, help="Number of mel bins [default: 64]")
+    parser.add_argument("--sr", type=int, default=22050, help="Sample rate [default: 22050]")
+    parser.add_argument("--n_mels", type=int, default=128, help="Number of mel bins [default: 128]")
     parser.add_argument("--n_fft", type=int, default=1024, help="FFT size [default: 1024]")
-    parser.add_argument("--hop_length", type=int, default=256, help="STFT hop length [default: 256]")
-    parser.add_argument("--duration", type=float, default=4.0, help="Audio duration [default: 4.0]")
+    parser.add_argument("--hop_length", type=int, default=512, help="STFT hop length [default: 512]")
+    parser.add_argument("--duration", type=float, default=5.0, help="Audio duration [default: 5.0]")
     parser.add_argument("--models", type=str, default="smallcnn,resnet18",
                        help="Comma-separated list of models to evaluate [default: smallcnn,resnet18]")
     parser.add_argument("--output", type=str, default=None,
@@ -125,12 +133,13 @@ def main():
         logger.error(f"Data root not found: {data_root}")
         sys.exit(1)
     
-    logger.info("Loading test dataset...")
-    test_ds = GTZAN(
+    logger.info("Loading dataset and splitting the same way as train.py...")
+    # Load dataset the same way as train.py: GTZAN with default split='train',
+    # then use random_split to create train/val/test (matching train.py exactly)
+    from torch.utils.data import random_split
+    
+    full_ds = GTZAN(
         root=str(data_root),
-        split='test',
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
         target_sr=args.sr,
         duration=args.duration,
         n_mels=args.n_mels,
@@ -139,16 +148,35 @@ def main():
         augment=None,
     )
     
+    # Rebuild the same split as train.py (deterministic with seed=42)
+    N = len(full_ds)
+    n_train = int(N * args.train_ratio)
+    n_val = int(N * args.val_ratio)
+    n_test = N - n_train - n_val
+    logger.info(f"Dataset split: {n_train} train / {n_val} val / {n_test} test")
+    
+    splits = [n_train, n_val, n_test] if n_test > 0 else [n_train, N - n_train]
+    parts = random_split(full_ds, splits, generator=torch.Generator().manual_seed(42))
+    train_ds, val_ds = parts[0], parts[1]
+    test_ds = parts[2] if len(parts) > 2 else None
+    
+    if test_ds is None:
+        logger.error("No test split available. Adjust train_ratio and val_ratio.")
+        sys.exit(1)
+    
     test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=True
+        pin_memory=(device.type == "cuda"),
     )
     
-    num_classes = len(test_ds.GENRES)
-    class_names = [test_ds.idx2name[i] for i in range(num_classes)]
+    # Get class names from the base dataset
+    base = test_ds.dataset if hasattr(test_ds, "dataset") else full_ds
+    idx2name = getattr(base, "idx2name", GENRES)
+    num_classes = len(idx2name)
+    class_names = [idx2name[i] for i in range(num_classes)]
     
     logger.info(f"Test dataset: {len(test_ds)} samples, {num_classes} classes")
     logger.info(f"Class names: {class_names}")

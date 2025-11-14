@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2025-01-13
+
+### Changed
+- Refactored `normalize_per_sample` function from `train.py` and `evaluate.py` into shared utility module `utils/normalization.py`
+- Updated `evaluate.py` default parameters to match `train.py` (sr=22050, n_mels=128, hop_length=512, duration=5.0)
+- Updated `evaluate.py` to use same split logic as `train.py` (random_split with seed=42)
+- Updated streaming inference default window size from 7.5s to 15.0s
+- Updated streaming inference examples to include `--spec_auto_gain` and `--auto_gain_norm` flags
+
+### Removed
+- Removed legacy `datasets/urbansound8k.py` file (no longer used after migration to GTZAN)
+- Removed debug script `debug_model.py`
+
+### Fixed
+- Fixed version inconsistency: `setup.py` now correctly shows version 0.2.1
+- Fixed `evaluate.py` to use per-sample normalization matching training pipeline
+- Fixed documentation inconsistencies in examples and README
+
+### Added
+- Added comprehensive tests for `normalize_per_sample` utility function
+
 ## [0.2.0] - 2025-01-09
 
 ### Changed

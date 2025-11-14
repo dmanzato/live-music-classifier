@@ -129,6 +129,8 @@ stream:
 	  --sr $(SR) --n_mels $(N_MELS) --n_fft $(N_FFT) --hop_length $(HOPLEN) \
 	  --win_sec $(WIN) --hop_sec $(HOP) \
 	  --topk $(TOPK) \
+	  --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
+	  --auto_gain_norm \
 	  $(if $(DEVICE),--device "$(DEVICE)",)
 
 # ------------------------------------------------------------
