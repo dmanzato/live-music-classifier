@@ -14,7 +14,8 @@ Example:
     --sr 22050 --n_mels 128 --n_fft 1024 --hop_length 512 \
     --win_sec 15 --hop_sec 0.5 --topk 5 \
     --spec_auto_gain --spec_pmin 5 --spec_pmax 95 \
-    --auto_gain_norm
+    --auto_gain_norm --gain_target_rms 0.2 --gain_max_mult 20.0 \
+    --gain_use_peak --highpass_freq 80.0
 """
 
 import argparse
@@ -30,6 +31,7 @@ import sounddevice as sd
 import torch
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
+from scipy import signal as scipy_signal
 
 from transforms.audio import get_mel_transform  # we'll compute mel here, log/pcen below
 from utils.device import get_device, get_device_name
@@ -126,10 +128,19 @@ def main():
     ap.add_argument("--spec_debug", action="store_true")
     ap.add_argument("--input_gain", type=float, default=1.0, help="Input gain multiplier (1.0=no change, >1.0=boost)")
     ap.add_argument("--auto_gain_norm", action="store_true", help="Auto-normalize input gain based on signal level")
+    ap.add_argument("--gain_target_rms", type=float, default=0.2, help="Target RMS level for auto gain (0.1-0.3 recommended)")
+    ap.add_argument("--gain_max_mult", type=float, default=20.0, help="Maximum gain multiplier (default 20.0 for external audio)")
+    ap.add_argument("--gain_use_peak", action="store_true", help="Use peak-based normalization instead of RMS (more sensitive)")
+    ap.add_argument("--gain_use_percentile", action="store_true", help="Use percentile-based normalization (more robust to outliers)")
+    ap.add_argument("--gain_percentile", type=float, default=95.0, help="Percentile for gain calculation (default 95.0)")
+    ap.add_argument("--gain_smooth", type=float, default=0.9, help="Gain smoothing factor (0.0=no smoothing, 0.9=heavy smoothing)")
+    ap.add_argument("--highpass_freq", type=float, default=80.0, help="High-pass filter cutoff (Hz, 0=disabled, helps remove rumble)")
+    ap.add_argument("--gain_debug", action="store_true", help="Print gain and signal level info (for debugging)")
 
     # trend line options
     ap.add_argument("--trend_len", type=int, default=120, help="Number of hops to keep in trend buffer")
     ap.add_argument("--trend_ema", type=float, default=0.0, help="EMA smoothing (0.0 disables)")
+    ap.add_argument("--prob_smooth", type=int, default=0, help="Average probabilities over last N hops (0=disabled, 4-6 recommended)")
 
     args = ap.parse_args()
 
@@ -235,6 +246,12 @@ def main():
     trend_buf = deque([np.nan] * trend_len, maxlen=trend_len)
     ema_val = None if args.trend_ema <= 0.0 else 0.0
     (trend_line,) = ax_trend.plot(xs, [np.nan] * trend_len, lw=2)
+    
+    # Probability smoothing buffer (for temporal averaging of predictions)
+    prob_smooth_buf = None
+    if args.prob_smooth > 0:
+        prob_smooth_buf = deque(maxlen=args.prob_smooth)
+        print(f"📈 Probability smoothing enabled: averaging over last {args.prob_smooth} predictions")
     ax_trend.set_ylim(0.0, 1.0)
     ax_trend.set_xlim(xs[0], xs[-1])
     try:
@@ -257,6 +274,22 @@ def main():
     # spectrogram clim management
     last_clim = None
     first_spec_frame = True
+    
+    # Adaptive gain state (for smoothing)
+    adaptive_gain_state = None
+    if args.auto_gain_norm and args.gain_smooth > 0.0:
+        adaptive_gain_state = {"gain": 1.0, "rms": 0.0}
+    
+    # High-pass filter for external audio (removes low-frequency noise/rumble)
+    hp_filter = None
+    if args.highpass_freq > 0 and args.sr > 0:
+        nyquist = args.sr / 2.0
+        if args.highpass_freq < nyquist:
+            # Design Butterworth high-pass filter
+            # Using lower order (2) for stability and faster processing
+            sos = scipy_signal.butter(2, args.highpass_freq / nyquist, btype='high', output='sos')
+            hp_filter = sos
+            print(f"🔊 High-pass filter enabled: {args.highpass_freq:.1f} Hz cutoff (removes rumble/noise)")
 
     # ------------- keyboard controls -------------
     state = {"paused": False, "running": True}
@@ -277,54 +310,146 @@ def main():
 
     print("🎙️  Streaming... (SPACE=pause/resume, q=quit)")
     if args.auto_gain_norm:
-        print("📊 Auto gain normalization enabled (helps with external audio sources)")
+        if args.gain_use_percentile:
+            method = f"percentile-based ({args.gain_percentile:.0f}th percentile)"
+        elif args.gain_use_peak:
+            method = "peak-based"
+        else:
+            method = f"RMS-based (target={args.gain_target_rms:.2f})"
+        print(f"📊 Auto gain normalization enabled: {method}, max gain={args.gain_max_mult:.1f}x")
+        if args.gain_smooth > 0.0:
+            print(f"   Gain smoothing: {args.gain_smooth:.2f} (higher=more stable)")
     elif args.input_gain != 1.0:
         print(f"📊 Input gain set to {args.input_gain:.2f}x")
     try:
         with stream:
             while state["running"]:
                 try:
-                    data = q.get(timeout=0.1).squeeze()
+                    data = q.get(timeout=0.1)
+                    if data is None or len(data) == 0:
+                        plt.pause(0.001)
+                        continue
+                    data = data.squeeze()
                 except queue.Empty:
                     plt.pause(0.001)
                     continue
-
-                if data.ndim > 1:
-                    data = data[:, 0]
-                L = len(data)
-                if L == 0:
-                    continue
-
-                if state["paused"]:
+                except Exception as e:
+                    print(f"Error getting audio data: {e}")
                     plt.pause(0.001)
                     continue
 
-                # roll buffer and append
-                if L >= window_size:
-                    buf[:] = data[-window_size:]
-                else:
-                    buf = np.roll(buf, -L)
-                    buf[-L:] = data
+                try:
+                    if data.ndim > 1:
+                        data = data[:, 0]
+                    L = len(data)
+                    if L == 0:
+                        continue
 
-                # === feature extraction on CPU ===
-                x = buf.astype(np.float32, copy=False)
+                    if state["paused"]:
+                        plt.pause(0.001)
+                        continue
+
+                    # roll buffer and append
+                    if L >= window_size:
+                        buf[:] = data[-window_size:]
+                    else:
+                        buf = np.roll(buf, -L)
+                        buf[-L:] = data
+
+                    # === feature extraction on CPU ===
+                    x = buf.astype(np.float32, copy=False)
+                except Exception as e:
+                    print(f"Error processing audio buffer: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    plt.pause(0.001)
+                    continue
+                
+                # Remove DC offset (common in external audio sources)
+                x = x - np.mean(x)
+                
+                # High-pass filter to remove low-frequency noise/rumble from external sources
+                # Using stateless filtering (simpler and more robust for rolling buffers)
+                if hp_filter is not None:
+                    try:
+                        x = scipy_signal.sosfilt(hp_filter, x)
+                    except Exception as e:
+                        # Fallback: disable filter if it fails
+                        print(f"Warning: High-pass filter failed: {e}, disabling filter")
+                        hp_filter = None
                 
                 # Input gain normalization (helps with external audio sources)
+                original_rms = np.sqrt(np.mean(x**2)) if args.gain_debug else None
+                original_peak = np.max(np.abs(x)) if args.gain_debug else None
+                
                 if args.auto_gain_norm:
-                    # Normalize to a target RMS level (0.1 is a reasonable level for speech/music)
-                    target_rms = 0.1
-                    current_rms = np.sqrt(np.mean(x**2))
-                    if current_rms > 1e-6:  # Avoid division by zero
-                        gain = target_rms / current_rms
-                        # Limit gain to reasonable range (0.1x to 10x)
-                        gain = np.clip(gain, 0.1, 10.0)
+                    try:
+                        # More sensitive normalization options
+                        if args.gain_use_percentile:
+                            # Percentile-based normalization (robust to outliers/transients)
+                            abs_x = np.abs(x)
+                            current_level = np.percentile(abs_x, args.gain_percentile)
+                            if current_level > 1e-6:
+                                # Target percentile level (typically 0.6-0.7 to avoid clipping)
+                                target_level = 0.65
+                                gain = target_level / current_level
+                            else:
+                                gain = 1.0
+                        elif args.gain_use_peak:
+                            # Peak-based normalization (more sensitive to transients)
+                            current_level = np.max(np.abs(x))
+                            if current_level > 1e-6:
+                                # Target peak level (lower to avoid clipping)
+                                target_peak = 0.7  # Reduced to avoid clipping
+                                gain = target_peak / current_level
+                            else:
+                                gain = 1.0
+                        else:
+                            # RMS-based normalization (most stable, recommended for external audio)
+                            current_rms = np.sqrt(np.mean(x**2))
+                            if current_rms > 1e-6:
+                                gain = args.gain_target_rms / current_rms
+                            else:
+                                gain = 1.0
+                        
+                        # Check for invalid gain values
+                        if not np.isfinite(gain) or gain <= 0:
+                            gain = 1.0
+                        
+                        # Apply gain smoothing to avoid rapid changes (helps with stability)
+                        if adaptive_gain_state is not None and args.gain_smooth > 0.0:
+                            alpha = 1.0 - args.gain_smooth
+                            prev_gain = adaptive_gain_state.get("gain", 1.0)
+                            smoothed_gain = alpha * gain + (1.0 - alpha) * prev_gain
+                            if np.isfinite(smoothed_gain) and smoothed_gain > 0:
+                                adaptive_gain_state["gain"] = smoothed_gain
+                                gain = smoothed_gain
+                            else:
+                                adaptive_gain_state["gain"] = gain
+                        
+                        # Limit gain to reasonable range (wider range for external audio)
+                        gain = float(np.clip(gain, 0.1, args.gain_max_mult))
                         x = x * gain
+                        
+                        # Clip to prevent overflow (important for peak/percentile methods)
+                        x = np.clip(x, -1.0, 1.0)
+                        
+                        # Debug output
+                        if args.gain_debug:
+                            new_rms = np.sqrt(np.mean(x**2))
+                            new_peak = np.max(np.abs(x))
+                            clipped_samples = np.sum(np.abs(x) >= 0.99)
+                            clip_pct = 100.0 * clipped_samples / len(x)
+                            print(f"Gain: {gain:.2f}x | RMS: {original_rms:.4f} -> {new_rms:.4f} | Peak: {original_peak:.4f} -> {new_peak:.4f} | Clipped: {clip_pct:.1f}%")
+                    except Exception as e:
+                        # Fallback: disable auto gain if it fails
+                        print(f"Warning: Auto gain normalization failed: {e}, using manual gain")
+                        x = x * args.input_gain
                 else:
                     # Apply manual gain
                     x = x * args.input_gain
-                
-                # Clip to prevent overflow
-                x = np.clip(x, -1.0, 1.0)
+                    # Clip to prevent overflow
+                    x = np.clip(x, -1.0, 1.0)
                 
                 wav_t = torch.from_numpy(x).unsqueeze(0)  # [1, T]
 
@@ -339,13 +464,31 @@ def main():
                 mel_feat_raw = mel_feat.copy()
 
                 # Per-clip standardization for inference (matches training)
-                mel_feat = (mel_feat - mel_feat.mean()) / (mel_feat.std() + 1e-6)
+                # For external audio, ensure we have enough signal before standardizing
+                mel_std = mel_feat.std()
+                mel_mean = mel_feat.mean()
+                
+                # If signal is too weak (very low std), it might be mostly noise
+                # In this case, we still standardize but it might not help much
+                if mel_std > 1e-3:  # Reasonable threshold for valid signal
+                    mel_feat = (mel_feat - mel_mean) / (mel_std + 1e-6)
+                else:
+                    # Very weak signal - just center it
+                    mel_feat = mel_feat - mel_mean
 
                 # inference on device
                 with torch.no_grad():
                     feats = torch.from_numpy(mel_feat).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,n_mels,time]
                     logits = model(feats)
                     probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+                # Temporal smoothing of probabilities (helps with external audio stability)
+                if prob_smooth_buf is not None:
+                    prob_smooth_buf.append(probs.copy())
+                    if len(prob_smooth_buf) > 1:
+                        # Average over the buffer
+                        probs_smoothed = np.mean(list(prob_smooth_buf), axis=0)
+                        probs = probs_smoothed
 
                 # top-k (UNCHANGED bars)
                 order = np.argsort(probs)[::-1][:topk]
